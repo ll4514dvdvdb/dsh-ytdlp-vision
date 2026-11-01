@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "ytdlp-vision",
+    "description": "Multi-platform video evidence for DSH (Bilibili via official API, everything else via yt-dlp): timestamped frames, subtitles, local ASR and OCR, with optional independent vision model analysis and self-updating yt-dlp."
+  }
+}

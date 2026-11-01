@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "ytdlp-vision 多平台视频理解",
+    "description": "为 DSH 提供多平台视频（B 站、YouTube、X 等）的时间戳画面、字幕、本地转写与 OCR，支持可选独立视觉模型分析；启动时自动更新 yt-dlp。"
+  }
+}

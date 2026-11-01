@@ -1,0 +1,66 @@
+{
+  "name": "ytdlp-vision",
+  "version": "0.3.0",
+  "description": "DSH 多平台视频证据插件：B 站走官方 API，其余站点交给 yt-dlp（1800+ 平台）；带时间戳画面、字幕/ASR 与 OCR 原生返回当前视觉模型，按需细看、缓存和可选独立 API；启动时自动更新 yt-dlp",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "author": "icyaaaww",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/icyaaaww/dsh-bili-vision.git"
+  },
+  "homepage": "https://github.com/icyaaaww/dsh-bili-vision#readme",
+  "bugs": {
+    "url": "https://github.com/icyaaaww/dsh-bili-vision/issues"
+  },
+  "files": [
+    "index.js",
+    "vision.py",
+    "sources.py",
+    "update.py",
+    "cordis.patch.yml",
+    "README.md",
+    "requirements.txt",
+    "smoke.mjs",
+    "scripts/*.py",
+    "vendor/yt-dlp-py.zip",
+    "vendor/VERSION.json",
+    "tests/*.py",
+    "tests/*.mjs",
+    "locale/*.json",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "bilibili",
+    "youtube",
+    "yt-dlp",
+    "video-understanding",
+    "whisper",
+    "ocr"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18",
+    "dsh": ">=0.2.0-rc.2 <0.3.0"
+  },
+  "scripts": {
+    "test": "node --test tests/plugin.test.mjs tests/host.test.mjs",
+    "test:python": "python -B -m unittest discover -s tests -p test_*.py -v",
+    "smoke": "node smoke.mjs",
+    "update-ytdlp": "python scripts/fetch-ytdlp.py"
+  }
+}

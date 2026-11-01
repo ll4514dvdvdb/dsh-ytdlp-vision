@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.tmp/
+.test-cache/
+.test-home/
+.probe/
+.test-*.txt
+*.log

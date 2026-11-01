@@ -1,0 +1,10 @@
+- insert:
+    - id: ytdlp-vision
+      name: 'ytdlp-vision'
+      inject: [tools]
+      config:
+        python: 'C:\Users\ASUS\.dsh\bili-vision-venv\Scripts\python.exe'
+        defaultPolicy: auto
+        timeoutMs: 1800000
+        updateOnBoot: true
+        updateIntervalHours: 0
