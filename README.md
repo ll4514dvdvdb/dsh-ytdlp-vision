@@ -116,33 +116,54 @@ python -m pip install -r requirements.txt
 
 ## Cookie 配置页面
 
-登录墙、年龄限制、会员视频需要 cookie。插件自带一个同源页面，不用改环境变量、不用手搓 Netscape 文件。
+登录墙、年龄限制、会员视频需要 cookie。插件自带一个同源页面，**点两下就能拿到 cookie**，不用改环境变量、不用手搓 Netscape 文件、不用去 F12 里翻。
 
 打开方式：侧栏图标「视频 Cookie」，或直接访问 `http://<GUI 地址>/ytdlp-vision-panel/`（只在 loopback 上应答）。
 
-**能做什么**
+### 自动抓取（推荐）
 
-| 功能 | 说明 |
-|---|---|
-| 分站点填 cookie | 预置 B 站 / YouTube / X / Vimeo / 抖音；每站点有独立开关 |
-| 整串粘贴解析 | 从浏览器复制 `SESSDATA=xxx; bili_jct=yyy` 或整行 Netscape，粘贴后自动拆成字段 |
-| 验证登录（B 站） | 调 `x/web-interface/nav` 实测 SESSDATA 是否有效，直接显示昵称和等级 |
-| 浏览器直读 | 让 yt-dlp 用 `--cookies-from-browser edge`（或 chrome/firefox…）现场读浏览器库，不落盘 |
-| 自定义站点 | 预设之外的站点，给个 id 和 cookie 域即可 |
-| 额外 Netscape 行 | 手写补充行，原样并入 `cookies.txt` |
-| 同步 | 生成 `~/.dsh/ytdlp-vision/cookies.txt`，yt-dlp 抓取时自动带 `--cookies` |
+1. 点「+ 生成新的 Cookies」
+2. 选一个站点快捷按钮（会自动填好登录页），或者自己贴任意网址
+3. 点「开始」——本机浏览器会打开那个页面
+4. 在里面正常登录
+5. **识别到登录态就自动关窗并保存**；识别不到（冷门站点）就自己点「保存并关闭」
 
-**存储与权限**
+保存的是**该站点域下的全部 cookie**，不做白名单裁剪，所以冷门站点的鉴权字段也不会漏。拿到的连带 cookie（`buvid3`、`_uuid`、`bili_ticket` 之类）原样留着，下次抓取时一并带上，风控更稳。
+
+**为什么能自动判定**：每个预设声明了关键的登录 cookie（比如 B 站要 `SESSDATA`，X 要 `auth_token`）。抓取时每 1.2 秒读一次浏览器里的 cookie 集合，关键项出现即认为登录完成。没有声明关键项的站点（自定义域名）不会自动关，交给「保存并关闭」按钮——**这个按钮在所有站点上都有**，包括会自动保存的那些，保证任何情况都能手动收尾。
+
+**原理**：插件以独立 profile 启动你本机的 Chrome/Edge（`--remote-debugging-port=0`，端口随机），通过 CDP 的 `Network.getAllCookies` 读 cookie，读完 `taskkill /T /F` 关掉整棵进程树。用的是独立 profile（`~/.dsh/ytdlp-vision/browser-profile`），不会碰你日常浏览器的数据；代价是首次要登录一次，之后 profile 里记着登录态，再抓就是点一下的事。
+
+查找浏览器的顺序：`YTDLP_VISION_BROWSER` 环境变量 → Windows 上的 Chrome / Edge / Brave → Linux/macOS 常见路径。找不到浏览器时页面上会直接说，自动抓取按钮变灰，手动填仍然可用。
+
+### 三种方式并存
+
+| 方式 | 适合 | 数据去向 |
+|---|---|---|
+| 自动抓取 | 绝大多数情况 | 全部 cookie 写进 `cookies.json` + `cookies.txt` |
+| 手动填写 | 不想开浏览器、只有一两串 cookie | 同上，只写你填的字段 |
+| 浏览器直读 | 不想把 cookie 落盘 | 不保存，yt-dlp 现场用 `--cookies-from-browser` |
+
+手动填写：把 `SESSDATA=xxx; bili_jct=yyy` 或整行 Netscape 粘贴进来，自动拆字段。
+
+### 预置站点
+
+B 站、YouTube、X/Twitter、抖音、TikTok、Twitch、Instagram、Facebook、Vimeo、AcFun、小红书、微博、Reddit、niconico、Dailymotion。
+
+预设只影响三件事：快捷按钮的登录页、自动判定的关键 cookie、默认域名范围。**填了不认识的网址也能用**——插件会从 hostname 推一个自定义站点出来（带公共后缀处理，`video.example.co.uk` → `example.co.uk`）。
+
+### 存储与权限
 
 - 配置：`~/.dsh/ytdlp-vision/cookies.json`（权限 0600）
 - 生成物：同目录 `cookies.txt`（0600，含 `# Netscape HTTP Cookie File` 头，过期时间写死远期）
+- 浏览器 profile：`~/.dsh/ytdlp-vision/browser-profile/`（首次抓取时创建）
 - 页面只返回**脱敏视图**（`abcd…wxyz`），明文值永远不离开本地进程
 - HTTP 面：只认 loopback 源地址；所有 API 要求自定义头 `x-ytdlp-vision`（跨站页面带不上它，也不实现预检）
-- 优先级：面板配置 > `BILI_VISION_SESSDATA` 环境变量 > 无
+- 优先级：面板配置 > `BILI_SESSDATA` 环境变量 > 无
 
-**B 站走官方 API，其余走 yt-dlp**：面板里 B 站的字段直接拼成请求头给 `api.bilibili.com`；其他站点写进 `cookies.txt` 交给 yt-dlp。选了「浏览器直读」时 yt-dlp 优先用 `--cookies-from-browser`，B 站仍然用面板里的字段。
+**B 站走官方 API，其余走 yt-dlp**：面板里 B 站的 cookie 直接拼成请求头给 `api.bilibili.com`；其他站点写进 `cookies.txt` 交给 yt-dlp。选了「浏览器直读」时 yt-dlp 优先用 `--cookies-from-browser`，B 站仍然用面板里的值。
 
-> cookie 等同于账号登录凭证。不要把 `cookies.json` / `cookies.txt` 提交到仓库、发到聊天里或截图外传。
+> cookie 等同于账号登录凭证。不要把 `cookies.json` / `cookies.txt` / `browser-profile` 提交到仓库、发到聊天里或截图外传。页面上的值都是脱敏的，但文件本身是明文。
 
 ---
 
@@ -182,6 +203,7 @@ python scripts/fetch-ytdlp.py     # 直接把最新版拉进 vendor/
 | `YTDLP_VISION_CACHE` | `~/.dsh/ytdlp-vision-cache` | 缓存根目录 |
 | `YTDLP_VISION_HOME` | `~/.dsh/ytdlp-vision` | cookie 配置、`cookies.txt`、yt-dlp 更新产物的目录 |
 | `YTDLP_VISION_PROXY` | 空 | 自更新下载用的代理；空则读 `HTTPS_PROXY` / `ALL_PROXY` |
+| `YTDLP_VISION_BROWSER` | 自动探测 | 自动抓 cookie 用的浏览器可执行文件路径（Chrome / Edge / Brave） |
 | `YTDLP_VISION_PYTHON` | 自动探测 | 指定解释器 |
 | `YTDLP_VISION_ASR_MODEL` | `small` | faster-whisper 模型（`base` 约 14× 实时，`small` 约 3×） |
 | `YTDLP_VISION_ASR_DEVICE` | `cpu` | 有 N 卡可设 `cuda` |

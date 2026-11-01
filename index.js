@@ -16,6 +16,7 @@ export const inject = ['tools']
 // Cookie 面板：数据层给 Python 侧共用同一份 cookies.json。
 import { createPanelRoute } from './panel/routes.js'
 import { CookieStore } from './panel/store.js'
+import { Grabber } from './panel/grabber.js'
 
 // Register native JSON Schema directly. No dependency discovery or identity fallback.
 const output = {
@@ -240,9 +241,24 @@ export function apply(ctx, config = {}) {
   // 属于可选能力：精简宿主或单测环境没有 ctx.inject 时跳过，核心工具照常可用。
   if (typeof ctx.inject === 'function') {
     const store = new CookieStore()
+    // 抓到登录态后整站覆盖：自动抓取拿到的就是该站点此刻的完整 cookie 集。
+    const grabber = new Grabber({
+      onSaved: async ({ siteId, label, domain, cookies, reason }) => {
+        await store.patchSite(siteId, {
+          enabled: true,
+          label,
+          domains: domain ? [domain] : undefined,
+          cookies,
+          replace: true,
+          source: 'grab'
+        })
+        await store.writeNetscape()
+        ctx.logger?.info?.(`[ytdlp-vision] 自动抓取完成：${label} ${cookies.length} 个 cookie（${reason}）`)
+      }
+    })
     ctx.inject(['webServer'], (sctx) => {
       sctx.effect(() => {
-        const dispose = sctx.webServer.register(createPanelRoute(store))
+        const dispose = sctx.webServer.register(createPanelRoute(store, grabber))
         return () => dispose?.()
       }, 'ytdlp-vision: cookie panel')
     })

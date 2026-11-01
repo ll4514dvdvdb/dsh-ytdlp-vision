@@ -6,47 +6,9 @@
 import { chmod, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { BROWSER_CHOICES, SITE_PRESETS, findPreset } from "./sites.js";
 
-/** 常用站点的表单预设：只影响页面显示，存储仍然按 id 自由扩展。 */
-export const SITE_PRESETS = [
-	{
-		id: "bilibili",
-		label: "哔哩哔哩",
-		domain: ".bilibili.com",
-		note: "SESSDATA 必填；bili_jct / buvid3 一并填更稳（1080P 与 CC 字幕都要登录态）。",
-		keys: ["SESSDATA", "bili_jct", "buvid3", "DedeUserID"]
-	},
-	{
-		id: "youtube",
-		label: "YouTube",
-		domain: ".youtube.com",
-		note: "会员/年龄限制视频才需要。最少给 SID + HSID + SSID + APISID + SAPISID。",
-		keys: ["SID", "HSID", "SSID", "APISID", "SAPISID", "__Secure-1PSID", "LOGIN_INFO"]
-	},
-	{
-		id: "twitter",
-		label: "X / Twitter",
-		domain: ".x.com",
-		note: "登录后才有的视频（敏感内容、订阅账号）需要 auth_token 和 ct0。",
-		keys: ["auth_token", "ct0"]
-	},
-	{
-		id: "vimeo",
-		label: "Vimeo",
-		domain: ".vimeo.com",
-		note: "付费或密码视频才需要。",
-		keys: ["vimeo", "is_logged_in"]
-	},
-	{
-		id: "douyin",
-		label: "抖音",
-		domain: ".douyin.com",
-		note: "部分作品要 sessionid；不填也能抓公开视频。",
-		keys: ["sessionid", "sessionid_ss", "ttwid", "msToken"]
-	}
-];
-
-export const BROWSER_CHOICES = ["off", "edge", "chrome", "chromium", "firefox", "brave", "safari"];
+export { BROWSER_CHOICES, SITE_PRESETS };
 
 export function visionHome() {
 	const base = process.env.YTDLP_VISION_HOME || process.env.BILI_VISION_HOME;
@@ -54,7 +16,7 @@ export function visionHome() {
 }
 
 function defaultConfig() {
-	return { version: 1, sites: {}, browser: { from: "off", name: "edge" }, extra: "" };
+	return { version: 2, sites: {}, browser: { from: "off", name: "edge" }, extra: "" };
 }
 
 function mask(value) {
@@ -70,19 +32,34 @@ function normalizeCookies(list) {
 		const name = typeof item?.name === "string" ? item.name.trim() : "";
 		const value = typeof item?.value === "string" ? item.value.trim() : "";
 		if (name.length === 0 || value.length === 0) continue;
-		out.push({ name, value });
+		const cookie = { name, value };
+		if (typeof item?.domain === "string" && item.domain.trim().length > 0) cookie.domain = item.domain.trim();
+		if (typeof item?.path === "string" && item.path.trim().length > 0) cookie.path = item.path.trim();
+		if (item?.secure === true) cookie.secure = true;
+		if (item?.httpOnly === true) cookie.httpOnly = true;
+		out.push(cookie);
 	}
 	return out;
 }
 
-/** 单站点：合并 cookies（同名覆盖，空值删除）。 */
+function normalizeDomains(entry, fallback) {
+	const list = Array.isArray(entry?.domains) ? entry.domains : [];
+	const merged = [...list, typeof entry?.domain === "string" ? entry.domain : "", ...(fallback ?? [])]
+		.map((item) => String(item ?? "").trim())
+		.filter((item) => item.length > 0);
+	return [...new Set(merged)];
+}
+
+/** 单站点：合并 cookies（同名同域覆盖，空值删除）。 */
 function mergeCookies(existing, incoming) {
-	const map = new Map((existing ?? []).map((item) => [item.name, item.value]));
+	const map = new Map();
+	for (const item of existing ?? []) map.set(`${item.domain ?? ""}\u0000${item.name}`, item);
 	for (const item of normalizeCookies(incoming)) {
-		if (item.value === "-") map.delete(item.name);
-		else map.set(item.name, item.value);
+		const key = `${item.domain ?? ""}\u0000${item.name}`;
+		if (item.value === "-") map.delete(key);
+		else map.set(key, item);
 	}
-	return [...map.entries()].map(([name, value]) => ({ name, value }));
+	return [...map.values()];
 }
 
 export class CookieStore {
@@ -111,14 +88,18 @@ export class CookieStore {
 			const sites = {};
 			for (const [id, entry] of Object.entries(parsed?.sites ?? {})) {
 				if (entry === null || typeof entry !== "object") continue;
+				const preset = findPreset(id);
 				sites[id] = {
 					enabled: entry.enabled === true,
-					domain: typeof entry.domain === "string" ? entry.domain : "",
+					label: typeof entry.label === "string" && entry.label.trim() ? entry.label.trim() : (preset?.label ?? id),
+					domains: normalizeDomains(entry, preset?.domains ?? []),
+					source: entry.source === "grab" ? "grab" : "manual",
+					updatedAt: Number.isFinite(entry.updatedAt) ? entry.updatedAt : null,
 					cookies: normalizeCookies(entry.cookies)
 				};
 			}
 			this.#value = {
-				version: 1,
+				version: 2,
 				sites,
 				browser: {
 					from: BROWSER_CHOICES.includes(parsed?.browser?.from) ? parsed.browser.from : "off",
@@ -148,14 +129,28 @@ export class CookieStore {
 		await this.load();
 		const siteId = String(id ?? "").trim();
 		if (siteId.length === 0 || !/^[a-z0-9._-]{1,40}$/i.test(siteId)) throw new Error("站点 id 不合法");
-		const preset = SITE_PRESETS.find((item) => item.id === siteId);
-		const current = this.#value.sites[siteId] ?? { enabled: false, domain: preset?.domain ?? "", cookies: [] };
-		const next = {
-			enabled: patch?.enabled === undefined ? current.enabled : patch.enabled === true,
-			domain: typeof patch?.domain === "string" && patch.domain.trim() ? patch.domain.trim() : current.domain,
-			cookies: mergeCookies(current.cookies, patch?.cookies)
+		const preset = findPreset(siteId);
+		const current = this.#value.sites[siteId] ?? {
+			enabled: false,
+			label: preset?.label ?? siteId,
+			domains: preset?.domains ?? [],
+			source: "manual",
+			updatedAt: null,
+			cookies: []
 		};
-		this.#value.sites[siteId] = next;
+		const incoming = normalizeCookies(patch?.cookies);
+		const domains = normalizeDomains(
+			{ domains: Array.isArray(patch?.domains) ? patch.domains : undefined, domain: patch?.domain },
+			current.domains.length > 0 ? current.domains : (preset?.domains ?? [])
+		);
+		this.#value.sites[siteId] = {
+			enabled: patch?.enabled === undefined ? current.enabled : patch.enabled === true,
+			label: typeof patch?.label === "string" && patch.label.trim() ? patch.label.trim().slice(0, 60) : current.label,
+			domains,
+			source: patch?.source === "grab" ? "grab" : patch?.source === "manual" ? "manual" : current.source,
+			updatedAt: incoming.length > 0 ? Date.now() : current.updatedAt,
+			cookies: patch?.replace === true ? incoming : mergeCookies(current.cookies, patch?.cookies)
+		};
 		await this.#persist();
 		return this.state();
 	}
@@ -191,10 +186,13 @@ export class CookieStore {
 		const lines = ["# Netscape HTTP Cookie File", "# generated by ytdlp-vision; do not edit by hand", ""];
 		for (const [id, site] of Object.entries(this.#value.sites)) {
 			if (!site.enabled || site.cookies.length === 0) continue;
-			const domain = site.domain || SITE_PRESETS.find((item) => item.id === id)?.domain || "";
-			if (!domain) continue;
-			const includeSub = domain.startsWith(".") ? "TRUE" : "FALSE";
-			for (const item of site.cookies) lines.push([domain, includeSub, "/", "TRUE", "4070908800", item.name, item.value].join("\t"));
+			const fallback = site.domains[0] ?? findPreset(id)?.domains?.[0] ?? "";
+			for (const item of site.cookies) {
+				const domain = item.domain ?? fallback;
+				if (!domain) continue;
+				const includeSub = domain.startsWith(".") ? "TRUE" : "FALSE";
+				lines.push([domain, includeSub, item.path ?? "/", item.secure === true ? "TRUE" : "TRUE", "4070908800", item.name, item.value].join("\t"));
+			}
 		}
 		const extra = this.#value.extra.trim();
 		if (extra.length > 0) lines.push(...extra.split(/\r?\n/).filter((line) => line.trim() && !line.startsWith("#")));
@@ -202,7 +200,7 @@ export class CookieStore {
 		const hasRows = body.split("\n").some((line) => line.length > 0 && !line.startsWith("#"));
 		if (!hasRows) {
 			this.#lastWrite = { path: this.cookieFilePath, rows: 0, at: Date.now() };
-			return { path: this.cookieFilePath, rows: 0, at: Date.now() };
+			return this.#lastWrite;
 		}
 		await mkdir(dirname(this.#path), { recursive: true });
 		const temporary = `${this.cookieFilePath}.tmp`;
@@ -213,32 +211,44 @@ export class CookieStore {
 		return this.#lastWrite;
 	}
 
-	/** 脱敏视图：页面只拿到名字与掩码，值要重填才会覆盖。 */
+	/** 脱敏视图：页面只拿到名字与掩码，值要重填或重新抓取才会覆盖。 */
 	async state() {
 		await this.load();
-		const sites = SITE_PRESETS.map((preset) => {
+		const sites = [];
+		for (const preset of SITE_PRESETS) {
 			const saved = this.#value.sites[preset.id];
-			const values = new Map((saved?.cookies ?? []).map((item) => [item.name, item.value]));
-			return {
+			sites.push({
 				id: preset.id,
 				label: preset.label,
 				note: preset.note,
-				domain: saved?.domain || preset.domain,
+				loginUrl: preset.loginUrl,
+				domains: saved?.domains?.length ? saved.domains : preset.domains,
 				preset: true,
 				enabled: saved?.enabled === true,
-				cookies: preset.keys.map((name) => ({ name, masked: mask(values.get(name) ?? ""), filled: values.has(name) }))
-			};
-		});
+				source: saved?.source ?? "manual",
+				updatedAt: saved?.updatedAt ?? null,
+				total: saved?.cookies?.length ?? 0,
+				keys: preset.keys,
+				need: preset.need,
+				cookies: (saved?.cookies ?? []).map((item) => ({ name: item.name, masked: mask(item.value), filled: true, domain: item.domain ?? "" }))
+			});
+		}
 		for (const [id, saved] of Object.entries(this.#value.sites)) {
-			if (SITE_PRESETS.some((preset) => preset.id === id)) continue;
+			if (findPreset(id) !== undefined) continue;
 			sites.push({
 				id,
-				label: id,
+				label: saved.label || id,
 				note: "自定义站点",
-				domain: saved.domain,
+				loginUrl: `https://${(saved.domains[0] ?? "").replace(/^\./, "")}`,
+				domains: saved.domains,
 				preset: false,
 				enabled: saved.enabled,
-				cookies: saved.cookies.map((item) => ({ name: item.name, masked: mask(item.value), filled: true }))
+				source: saved.source,
+				updatedAt: saved.updatedAt,
+				total: saved.cookies.length,
+				keys: saved.cookies.map((item) => item.name).slice(0, 8),
+				need: { all: [], any: [] },
+				cookies: saved.cookies.map((item) => ({ name: item.name, masked: mask(item.value), filled: true, domain: item.domain ?? "" }))
 			});
 		}
 		let cookieFile = { exists: false, bytes: 0, path: this.cookieFilePath };
@@ -248,11 +258,13 @@ export class CookieStore {
 		} catch {
 			// 还没生成过文件
 		}
+		const withCookies = sites.filter((site) => site.total > 0);
 		return {
 			configPath: this.#path,
 			cookieFile,
 			browser: this.#value.browser,
-			sites,
+			sites: sites.filter((site) => site.preset || site.total > 0),
+			stats: { sites: withCookies.length, cookies: withCookies.reduce((sum, site) => sum + site.total, 0) },
 			extra: { filled: this.#value.extra.trim().length > 0, lines: this.#value.extra.trim() ? this.#value.extra.trim().split(/\r?\n/).length : 0 },
 			authority: this.#value.browser.from !== "off" ? `browser:${this.#value.browser.name}` : cookieFile.exists ? "cookies.txt" : "none"
 		};

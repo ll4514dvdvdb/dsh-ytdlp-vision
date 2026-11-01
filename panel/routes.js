@@ -6,6 +6,8 @@
 import { promises as fs } from "node:fs";
 import { extname, join, normalize, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { findBrowser } from "./grabber.js";
+import { SITE_PRESETS } from "./sites.js";
 
 const WEB_ROOT = fileURLToPath(new URL("../web/", import.meta.url));
 const PREFIX = "/ytdlp-vision-panel";
@@ -116,7 +118,6 @@ async function probeBilibili(sessdata) {
 		result = { status: 0, body: null, error: String(error?.message ?? error) };
 	}
 	if (result.status === 412 || result.status === 0) {
-		// 风控页或连不上：交给系统代理再试一次（Node 默认读取 HTTP(S)_PROXY 需要 dispatcher，这里直接给出提示）。
 		return { ok: false, status: result.status, error: result.error ?? "B 站直连被风控(412)；请关掉全局代理后重试，或用代理直连 B 站" };
 	}
 	const body = result.body;
@@ -131,12 +132,48 @@ async function probeBilibili(sessdata) {
 	};
 }
 
-export function createPanelRoute(store) {
+export function createPanelRoute(store, grabber = null) {
 	const api = {
-		"GET state": async () => store.state(),
+		"GET state": async () => ({
+			state: await store.state(),
+			grab: grabber?.state() ?? { status: "idle" },
+			browser: (() => {
+				const found = findBrowser();
+				return found === null ? { ok: false, reason: "本机没有找到 Chrome / Edge" } : { ok: true, label: found.label };
+			})(),
+			presets: SITE_PRESETS.map((preset) => ({ id: preset.id, label: preset.label, loginUrl: preset.loginUrl, domains: preset.domains }))
+		}),
+
+		"GET grab/status": async () => ({ grab: grabber?.state() ?? { status: "idle" } }),
+
+		"POST grab/start": async (body) => {
+			if (grabber === null) throw new Error("自动抓取不可用");
+			await grabber.start({ url: body.url, siteId: body.siteId });
+			return { grab: grabber.state() };
+		},
+
+		"POST grab/finish": async () => {
+			if (grabber === null) throw new Error("自动抓取不可用");
+			const result = await grabber.finish();
+			return { result, state: await store.state(), grab: grabber.state() };
+		},
+
+		"POST grab/cancel": async () => {
+			if (grabber === null) throw new Error("自动抓取不可用");
+			const result = await grabber.cancel();
+			return { result, grab: grabber.state() };
+		},
 
 		"POST site": async (body) => {
-			await store.patchSite(body.id, { enabled: body.enabled, domain: body.domain, cookies: body.cookies });
+			await store.patchSite(body.id, {
+				enabled: body.enabled,
+				domains: body.domains,
+				domain: body.domain,
+				label: body.label,
+				cookies: body.cookies,
+				replace: body.replace === true,
+				source: body.source
+			});
 			await store.writeNetscape();
 			return { state: await store.state() };
 		},

@@ -21,23 +21,51 @@
 			</div>
 		</header>
 
-		<main class="grid">
-			<section class="card span-2 hint-card">
-				<h2>怎么用</h2>
-				<ol class="steps">
-					<li>只给需要的站点填。B 站最常用：登录后按 <kbd>F12</kbd> → Application → Cookies → <code>bilibili.com</code>，复制 <code>SESSDATA</code>（以及可选的 <code>bili_jct</code>、<code>buvid3</code>）。</li>
-					<li>也可以把浏览器里整串 <code>a=b; c=d</code> 粘到卡片下方的输入框，点「解析并填入」。</li>
-					<li>保存后立即生效：B 站走这里配置的登录态（1080P、CC 字幕、会员清晰度），其它站点由 yt-dlp 带着 <code>cookies.txt</code> 抓取。</li>
-				</ol>
-				<p class="warn-line">这些值是账号凭据，等同于你的登录状态。文件只存在本机（<code id="path-inline">…</code>，权限 0600），页面本身也只监听回环地址；不要截图外传，也不要把这个文件同步到网盘。</p>
+		<main class="stack">
+			<section class="card hero">
+				<div class="hero-main">
+					<div>
+						<h2>生成新的 Cookies</h2>
+						<p class="hint">
+							填一个网址，浏览器会打开它；你在里面登录，插件自动把该站点的 cookie 存下来。认不出登录态时，点「保存并关闭」也算数。
+						</p>
+					</div>
+					<button class="primary big" id="btn-grab" type="button">+ 生成新的 Cookies</button>
+				</div>
+				<p class="hint small" id="grab-availability"></p>
 			</section>
 
-			<div id="sites" class="span-2 site-list"></div>
+			<section class="card grab-card" id="grab-status" hidden>
+				<div class="grab-head">
+					<div>
+						<h2 id="grab-site">等待登录…</h2>
+						<p class="hint" id="grab-url"></p>
+					</div>
+					<span class="pill pulse" id="grab-count">0 个 cookie</span>
+				</div>
+				<p class="hint" id="grab-message">…</p>
+				<div class="chips" id="grab-names"></div>
+				<div class="row">
+					<button class="primary" id="btn-grab-save" type="button">保存并关闭</button>
+					<button class="ghost" id="btn-grab-cancel" type="button">取消</button>
+					<span class="muted" id="grab-tip"></span>
+				</div>
+			</section>
 
-			<section class="card" id="card-paste">
-				<h2>整串粘贴</h2>
-				<p class="hint">支持两种格式：浏览器里复制的 <code>name=value; name2=value2</code>，或 Netscape <code>cookies.txt</code> 的行。</p>
-				<textarea id="paste-input" rows="5" spellcheck="false" placeholder="SESSDATA=xxxx%2Cxxxx; bili_jct=yyyy; buvid3=zzzz"></textarea>
+			<section class="card">
+				<div class="section-head">
+					<h2>已保存</h2>
+					<span class="muted" id="site-stats"></span>
+				</div>
+				<div id="site-list" class="site-list"></div>
+			</section>
+
+			<details class="card fold" id="card-manual">
+				<summary><h2>手动填写</h2><span class="muted">不想开浏览器时用</span></summary>
+				<p class="hint">
+					粘贴浏览器里复制的 <code>name=value; name2=value2</code>，或 Netscape <code>cookies.txt</code> 的行。站点选好后点「解析并填入」。
+				</p>
+				<textarea id="paste-input" rows="4" spellcheck="false" placeholder="SESSDATA=xxxx%2Cxxxx; bili_jct=yyyy; buvid3=zzzz"></textarea>
 				<div class="row">
 					<label class="field">
 						站点
@@ -46,56 +74,80 @@
 					<button id="btn-parse" type="button">解析并填入</button>
 				</div>
 				<pre class="result" id="paste-result">等待粘贴…</pre>
-			</section>
+			</details>
 
-			<section class="card" id="card-browser">
-				<h2>从浏览器直接读</h2>
-				<p class="hint">开启后 yt-dlp 用 <code>--cookies-from-browser</code> 现场读取浏览器 cookie，不经过本文件（优先级高于下面的配置）。</p>
-				<div class="row">
-					<label class="field">
-						浏览器
-						<select id="browser-from">
-							<option value="off">不启用</option>
-							<option value="edge">Edge</option>
-							<option value="chrome">Chrome</option>
-							<option value="chromium">Chromium</option>
-							<option value="firefox">Firefox</option>
-							<option value="brave">Brave</option>
-							<option value="safari">Safari</option>
-						</select>
-					</label>
-					<button id="btn-browser" type="button">保存</button>
-				</div>
-				<p class="hint small">注意：Firefox 需要浏览器不在运行；Chromium 系在 Windows 上要用当前用户同一会话运行，否则读不到加密库。</p>
-			</section>
+			<details class="card fold" id="card-advanced">
+				<summary><h2>高级</h2><span class="muted">浏览器直读 / 自定义站点 / 额外行</span></summary>
 
-			<section class="card" id="card-custom">
-				<h2>自定义站点</h2>
-				<p class="hint">预设里没有的站点在这里加：给一个短 id（如 <code>netease</code>）和它的 cookie 域。</p>
-				<div class="row">
-					<label class="field">
-						id
-						<input type="text" id="custom-id" placeholder="example" spellcheck="false" />
-					</label>
-					<label class="field">
-						cookie 域
-						<input type="text" id="custom-domain" placeholder=".example.com" spellcheck="false" />
-					</label>
-					<button id="btn-custom" type="button">添加</button>
+				<div class="block">
+					<h3>从浏览器直接读</h3>
+					<p class="hint">开启后 yt-dlp 用 <code>--cookies-from-browser</code> 现场读你日常浏览器的 cookie，不经过本文件（优先级最高）。</p>
+					<div class="row">
+						<label class="field">
+							浏览器
+							<select id="browser-from">
+								<option value="off">不启用</option>
+								<option value="edge">Edge</option>
+								<option value="chrome">Chrome</option>
+								<option value="chromium">Chromium</option>
+								<option value="firefox">Firefox</option>
+								<option value="brave">Brave</option>
+								<option value="safari">Safari</option>
+							</select>
+						</label>
+						<button id="btn-browser" type="button">保存</button>
+					</div>
 				</div>
-			</section>
 
-			<section class="card span-2" id="card-extra">
-				<h2>额外的 Netscape 行</h2>
-				<p class="hint">站点不在上面的预设里、或需要按域精确指定时用。每行 <code>domain  TRUE  /  TRUE  4070908800  name  value</code>，制表符分隔。</p>
-				<textarea id="extra-input" rows="4" spellcheck="false" placeholder=".example.com&#9;TRUE&#9;/&#9;TRUE&#9;4070908800&#9;session&#9;abc123"></textarea>
-				<div class="row">
-					<button id="btn-extra" type="button">保存</button>
-					<button class="ghost" id="btn-sync" type="button">立即生成 cookies.txt</button>
-					<span class="muted" id="sync-hint"></span>
+				<div class="block">
+					<h3>自定义站点</h3>
+					<p class="hint">预设里没有的站点：给一个短 id 和它的 cookie 域，也可以直接用上面的「生成」抓。</p>
+					<div class="row">
+						<label class="field">
+							id
+							<input type="text" id="custom-id" placeholder="example" spellcheck="false" />
+						</label>
+						<label class="field">
+							cookie 域
+							<input type="text" id="custom-domain" placeholder=".example.com" spellcheck="false" />
+						</label>
+						<button id="btn-custom" type="button">添加</button>
+					</div>
 				</div>
-			</section>
+
+				<div class="block">
+					<h3>额外的 Netscape 行</h3>
+					<p class="hint">需要按域精确指定时用。每行 <code>domain  TRUE  /  TRUE  4070908800  name  value</code>，制表符分隔。</p>
+					<textarea id="extra-input" rows="3" spellcheck="false" placeholder=".example.com&#9;TRUE&#9;/&#9;TRUE&#9;4070908800&#9;session&#9;abc123"></textarea>
+					<div class="row">
+						<button id="btn-extra" type="button">保存</button>
+						<button class="ghost" id="btn-sync" type="button">立即生成 cookies.txt</button>
+						<span class="muted" id="sync-hint"></span>
+					</div>
+				</div>
+
+				<p class="warn-line">
+					这些值是账号凭据，等同于你的登录状态。文件只存在本机（<code id="path-inline">…</code>，权限 0600），页面只监听回环地址；不要截图外传，也不要同步到网盘。
+				</p>
+			</details>
 		</main>
+
+		<div class="modal" id="modal" hidden>
+			<div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+				<h2 id="modal-title">生成新的 Cookies</h2>
+				<p class="hint">先选一个站点，或直接填任意网址。</p>
+				<div class="chips" id="modal-presets"></div>
+				<label class="field wide">
+					URL
+					<input type="url" id="modal-url" placeholder="https://" spellcheck="false" autocomplete="off" />
+				</label>
+				<p class="hint small" id="modal-note">浏览器打开后请在里面登录；识别到登录态会自动关窗保存。</p>
+				<div class="row end">
+					<button class="ghost" id="btn-modal-cancel" type="button">取消</button>
+					<button class="primary" id="btn-modal-go" type="button">开始</button>
+				</div>
+			</div>
+		</div>
 
 		<div class="toast" id="toast" hidden></div>
 		<script src="app.js"></script>

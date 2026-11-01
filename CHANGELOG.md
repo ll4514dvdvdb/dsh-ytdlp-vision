@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.5.0 — 2026-11-01
+
+面板从「每站填一堆字段」改成「点一下、登录、完事」。配置量从十几个输入框降到 0。
+
+- **自动抓取**：点「+ 生成新的 Cookies」→ 选站点或填任意 URL → 本机浏览器打开登录页 → 登录后**自动关窗保存**。零依赖实现：spawn Chrome/Edge 带 `--remote-debugging-port=0` + 独立 `--user-data-dir`，读 `DevToolsActivePort` 拿端口，手写 RFC6455 客户端（`panel/ws.js`）连 CDP，`Target.attachToTarget({flatten:true})` + `Network.getAllCookies` 取 cookie，每 1.2s 轮询到关键项出现即完成，`taskkill /PID <pid> /T /F` 收尾。
+- **全部 cookie 落盘**：不再按白名单裁剪，站点域下抓到多少存多少（连带 `buvid3` / `_uuid` / `bili_ticket` 这类风控 cookie 一起留），冷门站点也不会漏字段。
+- **手动「保存并关闭」**：所有站点都有，包括会自动保存的预设。自定义域名没有关键项声明、不会自动关，靠这个按钮收尾。
+- **15 个预设**（`panel/sites.js`）：B 站、YouTube、X/Twitter、抖音、TikTok、Twitch、Instagram、Facebook、Vimeo、AcFun、小红书、微博、Reddit、niconico、Dailymotion。预设只决定登录页、自动判定用的关键 cookie、默认域名范围。
+- **任意网址可用**：`siteFromUrl()` 从 hostname 推自定义站点，带二级公共后缀处理（`video.example.co.uk` → `example.co.uk`）。
+- **三条路并存**：自动抓取（默认）/ 手动粘贴 / 浏览器直读（`--cookies-from-browser`），互不排斥。
+- **数据格式 v2**：站点从「固定字段列表」改成「cookie 数组」，每条保留 `domain/path/secure/httpOnly`；`cookies.txt` 按每条 cookie 自己的域输出。
+- **无浏览器时的降级**：`GET state` 返回 `browser:{ok,label|reason}`，找不到浏览器则「生成」按钮置灰并说明原因，手动填仍然可用。
+
+实测（Windows 11 + Chrome，`YTDLP_VISION_HEADLESS=1` 便于自动化）：`POST grab/start` 打开 bilibili.com 后 9 秒读到 14 个 cookie（`_uuid` / `b_lsid` / `b_nut` / `bili_ticket` / `bmg_*` / `buvid3` / `buvid4` / `buvid_fp` 等），状态 `satisfied:false`（未登录，符合预期）；`POST grab/finish` 保存 14 条 → `cookies.txt` 1287 B / 17 行，站点标记 `source:"grab"`；页面顶栏「共 14 个 cookie，来自 1 个站点」，站点行「14 个 · 自动抓取 · 11月1日 11:25」，展开可见脱敏列表；「验证登录」对无 SESSDATA 的集合正确提示「还没填 SESSDATA」；结束后无残留 chrome 进程。`tests/sites.test.mjs` 4/4（预设健全、`domainMatches` 双向后缀、`siteFromUrl` 预设与自定义、`isSatisfied` 空 need 恒 false）。
+
+> 升级说明：新增 `webServer` 路由与客户端 bundle，升级后必须**完全退出并重开 DSH**；`cookies.json` 会自动迁移到 v2 格式。
+
+Tested host: DSH 0.2.1-rc.3 on Windows 11, Python 3.12.14。其他宿主版本与操作系统需自行验证。
+
 ## 0.4.0 — 2026-11-01
 
 新增可视化 cookie 配置页面，登录态配置不再依赖环境变量。

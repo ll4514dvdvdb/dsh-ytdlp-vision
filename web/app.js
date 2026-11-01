@@ -1,303 +1,446 @@
-// 面板前端：读 store 的脱敏视图、按站点存 cookie、生成 cookies.txt。
-// 全部原生 DOM，没有构建步骤——它就是 iframe 里的一个普通页面。
-const ENDPOINT = "/ytdlp-vision-panel/api/";
+(function () {
+	"use strict";
 
-let state = null;
+	const ENDPOINT = "/ytdlp-vision-panel/api/";
+	const HEADER = { "x-ytdlp-vision": "1" };
 
-async function api(path, { method = "GET", body } = {}) {
-	const init = { method, headers: { "x-ytdlp-vision": "1" } };
-	if (body !== undefined) {
-		init.headers["content-type"] = "application/json";
-		init.body = JSON.stringify(body);
-	}
-	const response = await fetch(ENDPOINT + path, init);
-	const payload = await response.json().catch(() => ({ ok: false, error: "响应不是 JSON" }));
-	if (!response.ok || payload.ok === false) throw new Error(payload.error || `HTTP ${response.status}`);
-	return payload;
-}
+	const el = (id) => document.getElementById(id);
+	const $authority = el("authority-line");
+	const $filePill = el("file-pill");
+	const $siteList = el("site-list");
+	const $siteStats = el("site-stats");
+	const $grabAvailability = el("grab-availability");
+	const $grabCard = el("grab-status");
+	const $grabSite = el("grab-site");
+	const $grabUrl = el("grab-url");
+	const $grabCount = el("grab-count");
+	const $grabMessage = el("grab-message");
+	const $grabNames = el("grab-names");
+	const $modal = el("modal");
+	const $modalUrl = el("modal-url");
+	const $modalPresets = el("modal-presets");
+	const $modalNote = el("modal-note");
+	const $toast = el("toast");
 
-function el(tag, props = {}, ...children) {
-	const node = document.createElement(tag);
-	for (const [key, value] of Object.entries(props)) {
-		if (key === "class") node.className = value;
-		else if (key === "text") node.textContent = value;
-		else if (key.startsWith("data-")) node.setAttribute(key, value);
-		else if (key in node) node[key] = value;
-		else node.setAttribute(key, value);
-	}
-	for (const child of children.flat()) {
-		if (child === null || child === undefined) continue;
-		node.append(typeof child === "string" ? document.createTextNode(child) : child);
-	}
-	return node;
-}
+	let state = null;
+	let presets = [];
+	let grab = { status: "idle" };
+	let pollTimer = null;
+	let lastGrabStatus = "idle";
 
-let toastTimer = 0;
-function toast(message, bad = false) {
-	const node = document.getElementById("toast");
-	node.textContent = message;
-	node.hidden = false;
-	node.classList.toggle("bad", bad);
-	clearTimeout(toastTimer);
-	toastTimer = setTimeout(() => {
-		node.hidden = true;
-	}, bad ? 5200 : 2600);
-}
-
-function setStatus(card, message, kind = "") {
-	const node = card.querySelector(".site-status");
-	if (!node) return;
-	node.textContent = message;
-	node.className = `site-status${kind ? ` ${kind}` : ""}`;
-}
-
-/** 把一段文本拆成 cookie 名值对：兼容 `a=b; c=d` 和 Netscape 制表符行。 */
-function parseCookies(text) {
-	const out = [];
-	for (const rawLine of String(text).split(/\r?\n/)) {
-		const line = rawLine.trim();
-		if (!line || line.startsWith("#")) continue;
-		if (line.includes("\t")) {
-			const parts = line.split("\t");
-			if (parts.length >= 7) out.push({ name: parts[5].trim(), value: parts[6].trim() });
-			continue;
+	async function api(path, body) {
+		const options = { headers: { ...HEADER }, cache: "no-store" };
+		if (body !== undefined) {
+			options.method = "POST";
+			options.headers["content-type"] = "application/json";
+			options.body = JSON.stringify(body);
 		}
-		for (const part of line.split(";")) {
-			const index = part.indexOf("=");
-			if (index <= 0) continue;
-			const name = part.slice(0, index).trim();
-			const value = part.slice(index + 1).trim();
-			if (name && value) out.push({ name, value });
+		const response = await fetch(ENDPOINT + path, options);
+		const payload = await response.json().catch(() => ({ ok: false, error: `HTTP ${response.status}` }));
+		if (!response.ok || payload.ok === false) throw new Error(payload.error ?? `HTTP ${response.status}`);
+		return payload;
+	}
+
+	let toastTimer = null;
+	function toast(text, kind) {
+		$toast.textContent = text;
+		$toast.className = `toast ${kind ?? ""}`;
+		$toast.hidden = false;
+		clearTimeout(toastTimer);
+		toastTimer = setTimeout(() => {
+			$toast.hidden = true;
+		}, 3200);
+	}
+
+	function fmtTime(ms) {
+		if (!Number.isFinite(ms) || ms <= 0) return "";
+		const date = new Date(ms);
+		const pad = (n) => String(n).padStart(2, "0");
+		return `${date.getMonth() + 1}月${date.getDate()}日 ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+	}
+
+	function escapeHtml(text) {
+		return String(text ?? "").replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]);
+	}
+
+	/* ---------- 渲染 ---------- */
+
+	function renderTop() {
+		const file = state?.cookieFile ?? {};
+		$filePill.textContent = file.exists ? `cookies.txt · ${file.bytes} B` : "尚未生成 cookies.txt";
+		$filePill.classList.toggle("ok", file.exists === true);
+		const stats = state?.stats ?? { sites: 0, cookies: 0 };
+		if (state?.browser?.from && state.browser.from !== "off") {
+			$authority.textContent = `yt-dlp 使用浏览器直读：${state.browser.name}`;
+		} else if (stats.cookies > 0) {
+			$authority.textContent = `共 ${stats.cookies} 个 cookie，来自 ${stats.sites} 个站点`;
+		} else {
+			$authority.textContent = "还没有任何 cookie 配置（B 站按未登录处理）";
+		}
+		$siteStats.textContent = stats.cookies > 0 ? `${stats.sites} 个站点 · ${stats.cookies} 个 cookie` : "空";
+		el("path-inline").textContent = state?.configPath ?? "…";
+	}
+
+	function cookieRow(item) {
+		const domain = item.domain ? ` <span class="muted">${escapeHtml(item.domain)}</span>` : "";
+		return `<li><code>${escapeHtml(item.name)}</code><span class="val">${escapeHtml(item.masked)}</span>${domain}</li>`;
+	}
+
+	function renderSites() {
+		const all = state?.sites ?? [];
+		// 未填又没启用的预设不占地方，否则一进页面就是十几行空站点。
+		const sites = all.filter((site) => site.total > 0 || site.enabled || site.preset !== true);
+		if (sites.length === 0) {
+			$siteList.innerHTML = '<p class="empty">还没有保存任何站点。点上面的「生成新的 Cookies」开始。</p>';
+			return;
+		}
+		$siteList.innerHTML = sites
+			.map((site) => {
+				const source = site.source === "grab" ? "自动抓取" : "手动";
+				const stamp = fmtTime(site.updatedAt);
+				const meta = [site.total > 0 ? `${site.total} 个` : "未填", source, stamp].filter(Boolean).join(" · ");
+				const body =
+					site.total === 0
+						? '<p class="empty small">还没有值。点「生成」自动抓，或展开「手动填写」。</p>'
+						: `<ul class="kv-list">${site.cookies.map(cookieRow).join("")}</ul>`;
+				return `
+				<div class="site" data-id="${escapeHtml(site.id)}">
+					<div class="site-row">
+						<div class="site-name">
+							<strong>${escapeHtml(site.label)}</strong>
+							<span class="muted">${escapeHtml((site.domains ?? []).join(" "))}</span>
+							<span class="muted">${escapeHtml(meta)}</span>
+						</div>
+						<div class="site-actions">
+							<label class="switch" title="是否写进 cookies.txt">
+								<input type="checkbox" data-act="toggle" ${site.enabled ? "checked" : ""} />
+								<span></span>
+							</label>
+							<button class="ghost small" type="button" data-act="test">验证登录</button>
+							<button class="danger small" type="button" data-act="remove">删除</button>
+						</div>
+					</div>
+					<details>
+						<summary>${site.total > 0 ? `查看 ${site.total} 个 cookie` : "查看"}</summary>
+						${body}
+					</details>
+				</div>`;
+			})
+			.join("");
+	}
+
+	function renderPasteSites() {
+		const select = el("paste-site");
+		const current = select.value;
+		select.innerHTML = (state?.sites ?? [])
+			.map((site) => `<option value="${escapeHtml(site.id)}">${escapeHtml(site.label)}</option>`)
+			.join("");
+		if (current) select.value = current;
+	}
+
+	async function load() {
+		const payload = await api("state");
+		state = payload.state;
+		presets = payload.presets ?? [];
+		grab = payload.grab ?? { status: "idle" };
+		const availability = payload.browser ?? {};
+		$grabAvailability.textContent = availability.ok
+			? `将使用本机 ${availability.label}（独立 profile，首次需要登录一次）`
+			: `${availability.reason ?? "浏览器不可用"}：自动抓取用不了，请用下面的手动填写。`;
+		el("btn-grab").disabled = availability.ok !== true;
+		renderTop();
+		renderSites();
+		renderPasteSites();
+		el("browser-from").value = state?.browser?.from ?? "off";
+		renderGrab();
+	}
+
+	/* ---------- 自动抓取 ---------- */
+
+	function renderGrab() {
+		const status = grab?.status ?? "idle";
+		const active = ["launching", "waiting", "saving"].includes(status);
+		const finished = ["done", "closed", "cancelled"].includes(status);
+		$grabCard.hidden = !active && !finished;
+		if ($grabCard.hidden) return;
+		$grabSite.textContent = grab.siteLabel ?? grab.siteId ?? "等待登录…";
+		$grabUrl.textContent = grab.url ?? "";
+		const count = grab.cookies?.count ?? 0;
+		$grabCount.textContent = `${count} 个 cookie`;
+		$grabCount.classList.toggle("pulse", active);
+		$grabMessage.textContent = grab.message ?? "";
+		const names = grab.cookies?.names ?? [];
+		$grabNames.innerHTML = names.map((name) => `<span class="chip">${escapeHtml(name)}</span>`).join("");
+		el("btn-grab-save").disabled = !active;
+		el("btn-grab-cancel").disabled = !active;
+		const expected = grab.cookies?.expected ?? [];
+		if (active && expected.length > 0 && grab.cookies?.auto) {
+			const have = new Set(names);
+			const missing = expected.filter((name) => !have.has(name));
+			el("grab-tip").textContent = missing.length > 0 ? `还差：${missing.join(" / ")}` : "已识别到登录态";
+		} else if (active && grab.cookies?.auto === false) {
+			el("grab-tip").textContent = "该站点没有自动判定，登录后直接点「保存并关闭」";
+		} else {
+			el("grab-tip").textContent = "";
 		}
 	}
-	return out.filter((item) => item.name && item.value);
-}
 
-function renderSite(site) {
-	const card = el("div", { class: `site${site.enabled ? " active" : ""}`, "data-site": site.id });
-
-	const toggle = el("input", { type: "checkbox", checked: site.enabled === true });
-	toggle.addEventListener("change", async () => {
-		card.classList.toggle("active", toggle.checked);
+	async function pollGrab() {
+		clearTimeout(pollTimer);
 		try {
-			const payload = await api("site", { method: "POST", body: { id: site.id, enabled: toggle.checked } });
-			state = { ...state, ...payload.state };
-			toast(`${site.label}：${toggle.checked ? "已启用" : "已停用"}`);
+			const payload = await api("grab/status");
+			grab = payload.grab ?? { status: "idle" };
 		} catch (error) {
-			toggle.checked = !toggle.checked;
-			toast(String(error.message ?? error), true);
+			pollTimer = setTimeout(pollGrab, 3000);
+			return;
+		}
+		renderGrab();
+		const status = grab.status;
+		if (["launching", "waiting", "saving"].includes(status)) {
+			pollTimer = setTimeout(pollGrab, 1200);
+			return;
+		}
+		if (status !== lastGrabStatus) {
+			lastGrabStatus = status;
+			if (status === "done") toast(grab.message ?? "已保存", "ok");
+			else if (status === "closed" || status === "cancelled") toast(grab.message ?? "已结束");
+			await load().catch(() => {});
+			setTimeout(() => {
+				$grabCard.hidden = true;
+			}, 2600);
+		}
+	}
+
+	function openModal() {
+		$modal.hidden = false;
+		$modalUrl.value = "";
+		$modalNote.textContent = "浏览器打开后请在里面登录；识别到登录态会自动关窗保存。";
+		$modalUrl.focus();
+		$modalPresets.innerHTML = presets
+			.map(
+				(item) =>
+					`<button class="chip-btn" type="button" data-url="${escapeHtml(item.loginUrl)}">${escapeHtml(item.label)}</button>`
+			)
+			.join("");
+	}
+
+	function closeModal() {
+		$modal.hidden = true;
+	}
+
+	async function startGrab(url) {
+		closeModal();
+		$grabCard.hidden = false;
+		$grabSite.textContent = "正在启动浏览器…";
+		$grabMessage.textContent = "浏览器窗口马上会出现";
+		$grabCount.textContent = "0 个 cookie";
+		$grabNames.innerHTML = "";
+		el("btn-grab-save").disabled = true;
+		el("btn-grab-cancel").disabled = true;
+		try {
+			const payload = await api("grab/start", { url });
+			grab = payload.grab;
+			lastGrabStatus = grab.status;
+			renderGrab();
+			pollGrab();
+		} catch (error) {
+			toast(String(error.message ?? error), "err");
+			$grabCard.hidden = true;
+		}
+	}
+
+	/* ---------- 事件 ---------- */
+
+	el("btn-refresh").addEventListener("click", () => load().catch((error) => toast(String(error.message ?? error), "err")));
+	el("btn-grab").addEventListener("click", openModal);
+	el("btn-modal-cancel").addEventListener("click", () => {
+		closeModal();
+		$grabCard.hidden = true;
+	});
+	$modal.addEventListener("click", (event) => {
+		if (event.target === $modal) closeModal();
+	});
+	$modalPresets.addEventListener("click", (event) => {
+		const button = event.target.closest("button[data-url]");
+		if (!button) return;
+		$modalUrl.value = button.dataset.url;
+		$modalNote.textContent = `已选 ${button.textContent}，登录后会自动识别；识别不到就点「保存并关闭」。`;
+	});
+	el("btn-modal-go").addEventListener("click", () => {
+		const url = $modalUrl.value.trim();
+		if (!/^https?:\/\//i.test(url)) {
+			toast("URL 要以 http:// 或 https:// 开头", "err");
+			return;
+		}
+		startGrab(url);
+	});
+	$modalUrl.addEventListener("keydown", (event) => {
+		if (event.key === "Enter") el("btn-modal-go").click();
+	});
+
+	el("btn-grab-save").addEventListener("click", async () => {
+		try {
+			const payload = await api("grab/finish");
+			grab = payload.grab;
+			lastGrabStatus = "done";
+			toast(payload.result?.message ?? "已保存", "ok");
+			await load();
+			$grabCard.hidden = true;
+		} catch (error) {
+			toast(String(error.message ?? error), "err");
 		}
 	});
 
-	card.append(
-		el(
-			"div",
-			{ class: "site-head" },
-			el("div", { class: "site-title" }, el("strong", { text: site.label }), el("span", { class: "domain", text: site.domain || "—" })),
-			el("label", { class: "switch" }, toggle, el("span", { text: site.enabled ? "启用中" : "未启用" }))
-		)
-	);
-
-	if (site.note) card.append(el("p", { class: "site-note", text: site.note }));
-
-	const grid = el("div", { class: "kv" });
-	for (const cookie of site.cookies) {
-		const input = el("input", {
-			type: "password",
-			"data-cookie-name": cookie.name,
-			placeholder: cookie.filled ? cookie.masked : "未填写",
-			autocomplete: "off",
-			spellcheck: "false"
-		});
-		if (cookie.filled) input.classList.add("filled");
-		grid.append(el("label", { text: cookie.name }), input);
-	}
-	if (site.cookies.length === 0) grid.append(el("label", { text: "—" }), el("span", { class: "muted", text: "还没有字段，先把整串粘贴进来解析" }));
-	card.append(grid);
-
-	const save = el("button", { type: "button", text: "保存" });
-	save.addEventListener("click", async () => {
-		const cookies = [];
-		for (const input of card.querySelectorAll("input[data-cookie-name]")) {
-			const value = input.value.trim();
-			if (value === "") continue;
-			cookies.push({ name: input.dataset.cookieName, value });
+	el("btn-grab-cancel").addEventListener("click", async () => {
+		try {
+			const payload = await api("grab/cancel");
+			grab = payload.grab;
+			lastGrabStatus = "cancelled";
+			toast("已取消，没有保存");
+			await load();
+			$grabCard.hidden = true;
+		} catch (error) {
+			toast(String(error.message ?? error), "err");
 		}
-		if (cookies.length === 0 && site.preset) {
-			setStatus(card, "没有新值可存；输入框留空表示不修改", "bad");
+	});
+
+	$siteList.addEventListener("click", async (event) => {
+		const button = event.target.closest("button[data-act]");
+		if (!button) return;
+		const host = button.closest(".site");
+		const id = host?.dataset.id;
+		if (!id) return;
+		const act = button.dataset.act;
+		try {
+			if (act === "remove") {
+				if (!confirm(`删除 ${id} 的全部 cookie？`)) return;
+				await api("site/remove", { id });
+				toast("已删除");
+			} else if (act === "test") {
+				const payload = await api("test", { id });
+				const result = payload.result ?? {};
+				toast(result.detail ?? result.error ?? "已提交验证", result.ok === false ? "err" : "ok");
+				return;
+			}
+			await load();
+		} catch (error) {
+			toast(String(error.message ?? error), "err");
+		}
+	});
+
+	$siteList.addEventListener("change", async (event) => {
+		const input = event.target.closest('input[data-act="toggle"]');
+		if (!input) return;
+		const id = input.closest(".site")?.dataset.id;
+		if (!id) return;
+		try {
+			await api("site", { id, enabled: input.checked });
+			await load();
+		} catch (error) {
+			toast(String(error.message ?? error), "err");
+		}
+	});
+
+	el("btn-parse").addEventListener("click", async () => {
+		const text = el("paste-input").value;
+		const site = el("paste-site").value;
+		const cookies = parseCookies(text);
+		if (cookies.length === 0) {
+			el("paste-result").textContent = "没有解析出任何 name=value";
 			return;
 		}
 		try {
-			save.disabled = true;
-			const payload = await api("site", { method: "POST", body: { id: site.id, enabled: true, cookies } });
-			state = { ...state, ...payload.state };
-			renderAll();
-			toast(`${site.label} 已保存（${cookies.length} 个字段）`);
+			await api("site", { id: site, cookies, enabled: true, source: "manual" });
+			el("paste-result").textContent = `已写入 ${cookies.length} 个字段：${cookies.map((item) => item.name).join(", ")}`;
+			el("paste-input").value = "";
+			toast("已保存", "ok");
+			await load();
 		} catch (error) {
-			setStatus(card, String(error.message ?? error), "bad");
-		} finally {
-			save.disabled = false;
+			el("paste-result").textContent = String(error.message ?? error);
 		}
 	});
 
-	const test = el("button", { type: "button", class: "ghost", text: "验证登录" });
-	test.addEventListener("click", async () => {
+	function parseCookies(text) {
+		const out = [];
+		const seen = new Set();
+		for (const rawLine of String(text ?? "").split(/\r?\n/)) {
+			const line = rawLine.trim();
+			if (line.length === 0 || line.startsWith("#")) continue;
+			if (line.includes("\t")) {
+				const cells = line.split("\t");
+				if (cells.length >= 7) {
+					const name = cells[5].trim();
+					const value = cells[6].trim();
+					if (name && !seen.has(name)) {
+						seen.add(name);
+						out.push({ name, value, domain: cells[0] });
+					}
+					continue;
+				}
+			}
+			for (const pair of line.split(";")) {
+				const at = pair.indexOf("=");
+				if (at <= 0) continue;
+				const name = pair.slice(0, at).trim();
+				const value = pair.slice(at + 1).trim();
+				if (!name || seen.has(name)) continue;
+				seen.add(name);
+				out.push({ name, value });
+			}
+		}
+		return out;
+	}
+
+	el("btn-browser").addEventListener("click", async () => {
 		try {
-			test.disabled = true;
-			setStatus(card, "正在验证…");
-			const payload = await api("test", { method: "POST", body: { id: site.id } });
-			const result = payload.result ?? {};
-			setStatus(card, result.detail || result.error || "无结果", result.ok === true ? "ok" : result.ok === false ? "bad" : "");
+			await api("browser", { from: el("browser-from").value });
+			toast("已保存", "ok");
+			await load();
 		} catch (error) {
-			setStatus(card, String(error.message ?? error), "bad");
-		} finally {
-			test.disabled = false;
+			toast(String(error.message ?? error), "err");
 		}
 	});
 
-	const clear = el("button", { type: "button", class: "danger", text: "清空" });
-	clear.addEventListener("click", async () => {
-		if (!confirm(`清空 ${site.label} 的全部 cookie？此操作不可撤销。`)) return;
+	el("btn-custom").addEventListener("click", async () => {
+		const id = el("custom-id").value.trim();
+		const domain = el("custom-domain").value.trim();
+		if (!id || !domain) {
+			toast("id 和域都要填", "err");
+			return;
+		}
 		try {
-			const payload = await api("site/remove", { method: "POST", body: { id: site.id } });
-			state = { ...state, ...payload.state };
-			renderAll();
-			toast(`${site.label} 已清空`);
+			await api("site", { id, domains: [domain], enabled: true, source: "manual" });
+			el("custom-id").value = "";
+			el("custom-domain").value = "";
+			toast("已添加", "ok");
+			await load();
 		} catch (error) {
-			toast(String(error.message ?? error), true);
+			toast(String(error.message ?? error), "err");
 		}
 	});
 
-	const foot = el("div", { class: "site-foot" }, save, test, clear, el("span", { class: "site-status" }));
-	if (!site.preset) foot.classList.add("custom");
-	card.append(foot);
-	return card;
-}
+	el("btn-extra").addEventListener("click", async () => {
+		try {
+			await api("extra", { text: el("extra-input").value });
+			toast("已保存", "ok");
+			await load();
+		} catch (error) {
+			toast(String(error.message ?? error), "err");
+		}
+	});
 
-function renderAll() {
-	document.getElementById("path-inline").textContent = state.configPath ?? "~/.dsh/ytdlp-vision/cookies.json";
+	el("btn-sync").addEventListener("click", async () => {
+		try {
+			const payload = await api("sync");
+			el("sync-hint").textContent = `${payload.file.rows} 行 · ${new Date(payload.file.at).toLocaleTimeString()}`;
+			toast("已生成 cookies.txt", "ok");
+			await load();
+		} catch (error) {
+			toast(String(error.message ?? error), "err");
+		}
+	});
 
-	const authority = state.authority ?? "none";
-	const authorityText = {
-		none: "还没有任何 cookie 配置（B 站按未登录处理）",
-		"cookies.txt": "yt-dlp 使用 cookies.txt（由本页生成）",
-		browser: `yt-dlp 使用浏览器直读：${state.browser?.name ?? ""}`
-	}[authority.startsWith("browser:") ? "browser" : authority] ?? authority;
-	document.getElementById("authority-line").textContent = authorityText;
-
-	const pill = document.getElementById("file-pill");
-	const file = state.cookieFile ?? {};
-	if (file.exists) {
-		pill.textContent = `cookies.txt · ${file.bytes} B`;
-		pill.className = "pill ok";
-	} else {
-		pill.textContent = "尚未生成 cookies.txt";
-		pill.className = "pill";
-	}
-
-	const host = document.getElementById("sites");
-	host.replaceChildren(...state.sites.map(renderSite));
-
-	const select = document.getElementById("paste-site");
-	const current = select.value;
-	select.replaceChildren(
-		...state.sites.map((site) => {
-			const option = el("option", { value: site.id, text: site.label });
-			if (site.id === current) option.selected = true;
-			return option;
-		})
-	);
-
-	document.getElementById("browser-from").value = state.browser?.from ?? "off";
-	document.getElementById("sync-hint").textContent = file.exists ? `${file.path}` : "生成后 yt-dlp 会自动带上 --cookies";
-}
-
-async function load() {
-	try {
-		const payload = await api("state");
-		state = payload;
-		renderAll();
-	} catch (error) {
-		document.getElementById("authority-line").textContent = `读取失败：${error.message ?? error}`;
-		document.getElementById("authority-line").style.color = "var(--bad)";
-	}
-}
-
-document.getElementById("btn-refresh").addEventListener("click", () => load());
-
-document.getElementById("btn-parse").addEventListener("click", async () => {
-	const siteId = document.getElementById("paste-site").value;
-	const text = document.getElementById("paste-input").value;
-	const result = document.getElementById("paste-result");
-	const cookies = parseCookies(text);
-	if (cookies.length === 0) {
-		result.textContent = "没解析出任何 name=value，检查一下格式。";
-		return;
-	}
-	try {
-		const payload = await api("site", { method: "POST", body: { id: siteId, enabled: true, cookies } });
-		state = { ...state, ...payload.state };
-		renderAll();
-		result.textContent = `已写入 ${cookies.length} 个字段：${cookies.map((item) => item.name).join(", ")}`;
-		document.getElementById("paste-input").value = "";
-	} catch (error) {
-		result.textContent = `保存失败：${error.message ?? error}`;
-	}
-});
-
-document.getElementById("btn-browser").addEventListener("click", async () => {
-	const from = document.getElementById("browser-from").value;
-	try {
-		const payload = await api("browser", { method: "POST", body: { from, name: from } });
-		state = { ...state, ...payload.state };
-		renderAll();
-		toast(from === "off" ? "已关闭浏览器直读" : `已改用浏览器直读：${from}`);
-	} catch (error) {
-		toast(String(error.message ?? error), true);
-	}
-});
-
-document.getElementById("btn-extra").addEventListener("click", async () => {
-	const text = document.getElementById("extra-input").value;
-	try {
-		const payload = await api("extra", { method: "POST", body: { text } });
-		state = { ...state, ...payload.state };
-		renderAll();
-		toast(text.trim() ? "额外行已保存" : "额外行已清空");
-	} catch (error) {
-		toast(String(error.message ?? error), true);
-	}
-});
-
-document.getElementById("btn-sync").addEventListener("click", async () => {
-	try {
-		const payload = await api("sync", { method: "POST" });
-		state = { ...state, ...payload.state };
-		renderAll();
-		const rows = payload.file?.rows ?? 0;
-		toast(rows > 0 ? `已生成 cookies.txt（${rows} 行）` : "没有启用任何站点，未生成文件");
-	} catch (error) {
-		toast(String(error.message ?? error), true);
-	}
-});
-
-document.getElementById("btn-custom").addEventListener("click", async () => {
-	const id = document.getElementById("custom-id").value.trim();
-	const domain = document.getElementById("custom-domain").value.trim();
-	if (!/^[a-z0-9._-]{1,40}$/i.test(id)) {
-		toast("id 只能用字母、数字、点、下划线、连字符（1-40 字符）", true);
-		return;
-	}
-	try {
-		const payload = await api("site", { method: "POST", body: { id, domain, enabled: true, cookies: [] } });
-		state = { ...state, ...payload.state };
-		renderAll();
-		document.getElementById("custom-id").value = "";
-		document.getElementById("custom-domain").value = "";
-		toast(`已添加站点 ${id}`);
-	} catch (error) {
-		toast(String(error.message ?? error), true);
-	}
-});
-
-load();
+	load().catch((error) => {
+		$authority.textContent = `读取失败：${error.message ?? error}`;
+	});
+})();
