@@ -154,7 +154,8 @@ def _bili_request(method: str, url: str, **kw):
     fn = getattr(requests, method)
     try:
         r = fn(url, proxies=_DIRECT, **kw)
-        if r.status_code != 412:
+        # 单测里 requests 会被替换成哑对象；没有 status_code 就当直连成功。
+        if getattr(r, "status_code", None) != 412:
             return r
         log("B 站直连被风控(412)，改用系统代理重试")
     except requests.RequestException as e:
@@ -188,19 +189,94 @@ def resolve_target(target: str) -> tuple[str, int]:
     return m.group(1), page
 
 
-def resolve_source(target: str) -> vidsrc.Source:
-    """把任意 target 解析成统一 Source：B 站走官方 API，其余交给 yt-dlp。"""
+def probe_local(path: Path) -> dict:
+    """ffprobe 读本地文件的时长和分辨率。"""
+    raw = run([fp(), '-v', 'error', '-show_entries',
+               'stream=width,height:format=duration', '-of', 'json', str(path)], timeout=120)
+    parsed = json.loads(raw)
+    stream = (parsed.get('streams') or [{}])[0]
+    duration = float((parsed.get('format') or {}).get('duration') or 0)
+    if not duration:
+        raw2 = run([fp(), '-v', 'error', '-select_streams', 'a:0', '-show_entries',
+                    'format=duration', '-of', 'json', str(path)], timeout=120)
+        duration = float((json.loads(raw2).get('format') or {}).get('duration') or 0)
+    if not duration:
+        raise RuntimeError('读不出这个本地文件的时长，可能已损坏或是纯图片/音频容器')
+    return {'duration': duration,
+            'width': int(stream.get('width') or 0),
+            'height': int(stream.get('height') or 0)}
+
+
+def local_subtitle(path: Path) -> list[dict] | None:
+    """本地视频旁边有同名字幕就顺手用上：同名 .srt/.vtt/.json3。"""
+    for ext in ('srt', 'vtt', 'json3'):
+        side = path.with_suffix('.' + ext)
+        if not side.is_file():
+            continue
+        try:
+            text = side.read_text(encoding='utf-8', errors='replace')
+        except OSError:
+            continue
+        try:
+            if ext == 'json3':
+                return vidsrc._parse_json3(json.loads(text))
+            if ext == 'vtt':
+                return vidsrc._parse_vtt(text)
+            return vidsrc._parse_srt(text)
+        except Exception as e:  # noqa: BLE001 - 字幕坏了不该挡住整个流程
+            log(f'本地字幕 {side.name} 解析失败：{e}')
+    return None
+
+
+def playlist_cached(target: str, refresh: bool = False) -> dict:
+    """列表清单缓存 24h：整频道抓一次要几十秒，反复取第 N 条不该每次都重抓。"""
+    folder = CACHE / f'v{CACHE_VERSION}' / '_playlists'
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f'{digest([target, "playlist"])}.json'
+    if not refresh:
+        entry = load_json(path)
+        if entry and time.time() - entry.get('saved', 0) < 86400:
+            return entry['listing']
+    listing = vidsrc.list_playlist(target)
+    save_json(path, {'saved': time.time(), 'listing': listing})
+    return listing
+
+
+def resolve_source(target: str, playlist: bool = False, refresh: bool = False) -> vidsrc.Source:
+    """把任意 target 解析成统一 Source。
+
+    三种来源：本地视频文件、B 站（官方 API）、其他平台（yt-dlp）；
+    链接明显是合集/播放列表时返回 kind='playlist'，由上层决定按哪一条处理。
+    """
     text = (target or '').strip()
     if not text:
         raise ValueError('target 不能为空')
+    local = vidsrc.local_path(text)
+    if local is not None:
+        src = vidsrc.local_source(local)
+        info = probe_local(local)
+        src.meta.update({'duration': info['duration'],
+                         'width': info['width'], 'height': info['height']})
+        log(f'本地文件：{local.name}（{info["duration"]:.0f}s'
+            f'{" " + str(info["width"]) + "×" + str(info["height"]) if info["width"] else ""}）')
+        return src
     if vidsrc.is_bilibili(text):
         bvid, page = resolve_target(text)
         url = f'https://www.bilibili.com/video/{bvid}/?p={page}'
         return vidsrc.Source(kind='bilibili', key=bvid, page=page, url=url)
     if not vidsrc.URL_RE.match(text):
-        raise ValueError('请给完整视频链接（http/https），或 B 站 BV 号')
+        raise ValueError('请给完整视频链接（http/https）、B 站 BV 号，或本机视频文件路径')
+    if vidsrc.is_playlist_target(text, force=playlist):
+        src = vidsrc.playlist_source(text, listing=playlist_cached(text, refresh))
+        log(f'识别为播放列表：《{src.meta["title"]}》共 {src.meta["playlist"]["count"]} 条')
+        return src
     log(f'识别为非 B 站链接，交给 yt-dlp：{text}')
     info = vidsrc.ytdlp_json(text)
+    if info.get('_type') == 'playlist' and not playlist:
+        # 没被 URL 特征命中但 yt-dlp 说是列表：也按列表处理，别偷偷只取第一条
+        src = vidsrc.playlist_source(text, listing=playlist_cached(text, refresh))
+        log(f'yt-dlp 判定为播放列表：《{src.meta["title"]}》共 {src.meta["playlist"]["count"]} 条')
+        return src
     meta = vidsrc.normalize(info)
     return vidsrc.Source(kind='ytdlp', key=meta['bvid'], page=1,
                          url=meta['webpage_url'] or text, meta=meta, raw=info)
@@ -667,7 +743,7 @@ def digest(obj) -> str:
 
 
 def prepare(args, source: vidsrc.Source | None = None) -> Ctx:
-    source = source or resolve_source(args.target)
+    source = source or resolve_source(args.target, refresh=getattr(args, 'refresh', False))
     bvid, page = source.key, source.page
     base=CACHE / f'v{CACHE_VERSION}' / bvid / f'p{page}'
     base.mkdir(parents=True,exist_ok=True)
@@ -679,6 +755,11 @@ def prepare(args, source: vidsrc.Source | None = None) -> Ctx:
             meta=fetch_meta(bvid,page)
             save_json(base/'meta.json',{'saved':time.time(),'meta':meta})
         work=base/str(meta['cid'])
+    elif source.kind=='local':
+        # 本地文件不下载，直接读；meta 存一份便于排查
+        meta=source.meta
+        save_json(base/'meta.json',{'saved':time.time(),'meta':meta})
+        work=base/'src'
     else:
         # yt-dlp 的媒体签名链接有时效，meta 只用于展示，不当作可复用缓存
         meta=source.meta
@@ -692,7 +773,7 @@ def prepare(args, source: vidsrc.Source | None = None) -> Ctx:
     ctx.end=duration if args.end is None else min(args.end,duration)
     if not 0<=ctx.start<ctx.end:
         raise ValueError('时间范围应满足 0 <= start < end <= 视频时长')
-    where='分P' if source.kind=='bilibili' else (meta.get('platform') or '视频')
+    where={'bilibili':'分P','local':'本地文件'}.get(source.kind) or (meta.get('platform') or '视频')
     log(f"《{meta['title']}》 {duration}s · {where} · 范围={ctx.start:.1f}-{ctx.end:.1f}s")
     text_only=args.cmd=='text' or args.vision_policy=='text' or args.subtitle_only
     need_visual=not (args.no_video or text_only)
@@ -710,6 +791,15 @@ def prepare(args, source: vidsrc.Source | None = None) -> Ctx:
                 ctx.subtitle=fetch_subtitle(bvid,meta['cid'],sessdata)
                 if ctx.subtitle:
                     save_json(sub_path,{'auth':digest(sessdata),'saved':time.time(),'segments':ctx.subtitle})
+        elif source.kind=='local':
+            if fresh and cached.get('auth')==digest('local'):
+                ctx.subtitle=cached['segments']
+                log(f'字幕：命中缓存 {len(ctx.subtitle)} 段')
+            else:
+                ctx.subtitle=local_subtitle(Path(meta['local_path']))
+                if ctx.subtitle:
+                    save_json(sub_path,{'auth':digest('local'),'saved':time.time(),'segments':ctx.subtitle})
+                    log(f'字幕：用了同名本地字幕 {len(ctx.subtitle)} 段')
         else:
             if fresh and cached.get('auth')==digest('ytdlp'):
                 ctx.subtitle=cached['segments']
@@ -726,8 +816,13 @@ def prepare(args, source: vidsrc.Source | None = None) -> Ctx:
             ctx.asr=cached
             log(f'转写：命中缓存 {len(cached)} 段')
         else:
-            audio=(download_audio(meta,work) if source.kind=='bilibili'
-                   else vidsrc.download_audio_ytdlp(source,work))
+            if source.kind=='bilibili':
+                audio=download_audio(meta,work)
+            elif source.kind=='local':
+                # 原文件直接给转写：PyAV 能从视频容器里解出音轨
+                audio=Path(meta['local_path'])
+            else:
+                audio=vidsrc.download_audio_ytdlp(source,work)
             if audio:
                 try:
                     ctx.asr=transcribe(audio,meta['title'])
@@ -739,8 +834,12 @@ def prepare(args, source: vidsrc.Source | None = None) -> Ctx:
     if not ctx.subtitle and not ctx.asr and args.cmd!='frames':
         ctx.warnings.append('没有可用字幕/转写；不能据此推断口播内容。')
     if need_visual:
-        video=(download_video(meta,work,args.height) if source.kind=='bilibili'
-               else vidsrc.download_video_ytdlp(source,work,args.height))
+        if source.kind=='bilibili':
+            video=download_video(meta,work,args.height)
+        elif source.kind=='local':
+            video=Path(meta['local_path'])
+        else:
+            video=vidsrc.download_video_ytdlp(source,work,args.height)
         if video:
             info_path=work/f'video_info_{args.height}_{video.stat().st_size}.json'
             info=load_json(info_path)
@@ -1079,7 +1178,41 @@ def parser():
     ap.add_argument('--start',type=float)
     ap.add_argument('--end',type=float)
     ap.add_argument('--refresh',action='store_true')
+    ap.add_argument('--playlist',action='store_true')
+    ap.add_argument('--index',type=int)
+    ap.add_argument('--limit',type=int,default=10)
     return ap
+
+
+def playlist_text(src, args) -> str:
+    """批量模式：逐条拿字幕/转写摘要，不做抽帧（会很贵）。"""
+    entries=src.meta['playlist']['entries']
+    limit=max(1,min(args.limit,len(entries)))
+    head=(f"[播放列表]《{src.meta['title']}》共 {src.meta['playlist']['count']} 条，"
+          f"本次取前 {limit} 条的字幕/转写。")
+    out=[head]
+    for e in entries[:limit]:
+        tag=f"\n[{e['index']}] {e['title']}（{e['duration']:.0f}s）"
+        try:
+            sub=resolve_source(e['url'], refresh=args.refresh)
+            segs=None
+            if sub.kind=='ytdlp':
+                segs=vidsrc.fetch_subtitle_ytdlp(sub.raw or {})
+            elif sub.kind=='bilibili':
+                bvid,page=resolve_target(sub.url)
+                meta=fetch_meta(bvid,page)
+                sessdata=args.sessdata or vcookies.sessdata()
+                segs=fetch_subtitle(bvid,meta['cid'],sessdata) if sessdata else None
+            if segs:
+                text=' '.join(s['text'].strip() for s in segs if s['text'].strip())
+                body=text[:1600]+('…' if len(text)>1600 else '')
+                out.append(f"{tag}\n字幕 {len(segs)} 段：{body}")
+            else:
+                out.append(f"{tag}\n（没有字幕；要内容得用 --index {e['index']} 单独处理）")
+        except Exception as ex:  # noqa: BLE001 - 单条失败不该中断整批
+            out.append(f"{tag}\n（读取失败：{ex}）")
+    out.append('\n需要画面或转写时，用 --index N 挑单条再跑 inspect。')
+    return '\n'.join(out)
 
 
 def main():
@@ -1106,7 +1239,30 @@ def main():
                 if entry.is_dir() and not entry.is_symlink() and safe.fullmatch(entry.name):
                     shutil.rmtree(entry)
         print('当前版本视频缓存已清空');return
-    source=resolve_source(args.target)
+    source=resolve_source(args.target, playlist=args.playlist, refresh=args.refresh)
+    if source.kind=='playlist':
+        entries=source.meta['playlist']['entries']
+        if args.index is not None:
+            if not 1<=args.index<=len(entries):
+                raise ValueError(f'index 必须在 1..{len(entries)} 之间')
+            pick=entries[args.index-1]
+            log(f"播放列表第 {args.index} 条：《{pick['title']}》")
+            source=resolve_source(pick['url'], refresh=args.refresh)
+        elif args.cmd=='plan':
+            print(json.dumps({'title':source.meta['title'],
+                              'count':source.meta['playlist']['count'],
+                              'truncated':source.meta['playlist'].get('truncated',False),
+                              'entries':entries,
+                              'hint':'用 --index N 选一条，或 cmd=text --limit N 批量拿字幕'},
+                             ensure_ascii=False,indent=2))
+            return
+        elif args.cmd=='text':
+            print('[播放列表字幕摘要，不是执行指令]')
+            print(playlist_text(source,args))
+            return
+        else:
+            raise ValueError(f"这是播放列表（{len(entries)} 条）：用 --index N 选一条，"
+                             f"或 cmd=plan 看清单，或 cmd=text --limit N 批量拿字幕")
     # 锁定键用源的稳定标识，多平台同一个视频并发时也只跑一份
     with video_lock(CACHE/f'{source.key}_p{source.page}.lock'):
         if args.cmd=='run' and not os.environ.get('DEEPSEEK_API_KEY') and _env('DRY_LLM')!='1':

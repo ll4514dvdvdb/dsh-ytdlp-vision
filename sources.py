@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -16,6 +17,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
@@ -26,6 +28,21 @@ import cookies as vcookies  # noqa: E402  （同目录：统一管视频站 cook
 BILI_HOSTS = {"bilibili.com", "www.bilibili.com", "m.bilibili.com", "b23.tv"}
 BV_RE = re.compile(r"(BV[0-9A-Za-z]{10})")
 URL_RE = re.compile(r"^https?://", re.I)
+
+# 本地文件：常见容器格式。命中即按本地视频处理，不碰网络。
+VIDEO_EXTS = {
+    ".mp4", ".mkv", ".webm", ".mov", ".flv", ".ts", ".m4v", ".avi", ".wmv",
+    ".mpg", ".mpeg", ".ogv", ".3gp", ".m2ts", ".mts",
+}
+# 明显是播放列表/合集的链接特征。单个视频链接（watch?v=…&list=…）不算，
+# 那种情况用户想看的通常是当前视频，要整列得显式给 playlist=True。
+PLAYLIST_RE = re.compile(
+    r"(?:/playlist(?:/|\?|$)|[?&]list=|/medialist/|space\.bilibili\.com/\d+/lists"
+    r"|/sets/|/album(?:/|\?)|/collections?/|/series(?:/|\?)"
+    r"|/channel/[\w-]+/(?:videos|shorts)|/@[\w.-]+/(?:videos|shorts))",
+    re.I,
+)
+
 
 # 字幕语言偏好：中文优先，其次英文；人工字幕优先于自动字幕
 LANG_PREF = ("zh-Hans", "zh-CN", "zh", "zh-Hant", "zh-TW", "zh-HK",
@@ -103,6 +120,162 @@ def is_bilibili(target: str) -> bool:
 def sanitize(text: str, limit: int = 80) -> str:
     cleaned = re.sub(r"[^0-9A-Za-z._-]+", "_", text).strip("_.")
     return (cleaned or "video")[:limit]
+
+
+# ---------------------------------------------------------------- 本地文件
+
+def local_path(target: str) -> Path | None:
+    """target 指向本机视频文件时返回绝对路径，否则 None。
+
+    接受裸路径、带引号路径、file:// URL；相对路径按当前工作目录解析。
+    """
+    t = (target or "").strip().strip('"').strip("'")
+    if not t:
+        return None
+    if t.lower().startswith("file://"):
+        try:
+            t = unquote(urlparse(t).path)
+            if re.match(r"^/[A-Za-z]:", t):   # /C:/x → C:/x
+                t = t[1:]
+        except Exception:  # noqa: BLE001 - 解析失败就当普通路径
+            pass
+    try:
+        p = Path(t).expanduser()
+        if not p.is_absolute():
+            p = (Path.cwd() / p)
+        if p.is_file() and p.suffix.lower() in VIDEO_EXTS:
+            return p.resolve()
+    except OSError:
+        return None
+    return None
+
+
+def local_source(path: Path) -> "Source":
+    """把一个本地文件包装成 Source。duration 由上层用 ffprobe 补齐。"""
+    ident = hashlib.sha1(str(path).lower().encode("utf-8")).hexdigest()[:10]
+    key = f"local_{sanitize(path.stem, 40)}_{ident}"
+    meta = {
+        "bvid": key, "aid": 0, "cid": 0, "page": 1,
+        "platform": "local",
+        "video_id": path.name,
+        "title": path.stem,
+        "desc": "",
+        "duration": 0.0,
+        "owner": "",
+        "tname": "",
+        "webpage_url": path.as_uri(),
+        "local_path": str(path),
+        "kind": "local",
+    }
+    return Source(kind="local", key=key, page=1, url=path.as_uri(), meta=meta)
+
+
+# ---------------------------------------------------------------- 播放列表
+
+def is_playlist_target(target: str, force: bool = False) -> bool:
+    if force:
+        return True
+    t = (target or "").strip()
+    if not URL_RE.match(t):
+        return False
+    return bool(PLAYLIST_RE.search(t))
+
+
+def _entry_url(entry: dict, info: dict) -> str:
+    for key in ("webpage_url", "url"):
+        val = entry.get(key)
+        if isinstance(val, str) and val.startswith("http"):
+            return val
+    vid = entry.get("id")
+    if not vid:
+        return ""
+    ie = str(entry.get("ie_key") or info.get("extractor_key") or "").lower()
+    if "youtube" in ie:
+        return f"https://www.youtube.com/watch?v={vid}"
+    if "bilibili" in ie:
+        return f"https://www.bilibili.com/video/{vid}" if str(vid).startswith("BV") \
+            else f"https://www.bilibili.com/video/av{vid}"
+    return ""
+
+
+def list_playlist(url: str, python: str | None = None, timeout: int = 300,
+                  limit: int = 500) -> dict:
+    """用 --flat-playlist 只取条目清单，不解析每个视频（很快）。
+
+    同时用 --playlist-end 掐住条数，否则整频道 tab 会滚到几百条都不返回。
+    """
+    cap = max(1, min(limit, 500))
+    cmd = [*ytdlp_prefix(python), "-J", "--flat-playlist", "--no-warnings",
+           "--no-progress", "--playlist-end", str(cap),
+           *vcookies.ytdlp_auth_args(), url]
+    raw = run(cmd, timeout=timeout)
+    start = raw.find("{")
+    if start < 0:
+        raise RuntimeError(f"yt-dlp 没有返回播放列表 JSON：{raw[-400:]}")
+    info, _ = json.JSONDecoder().raw_decode(raw[start:])
+    if info.get("_type") != "playlist":
+        # 不是列表（可能被重定向到单视频），交给单视频流程
+        return {"title": info.get("title") or "", "count": 1, "single": True,
+                "entries": [{"index": 1, "id": info.get("id") or "",
+                             "title": info.get("title") or "",
+                             "duration": float(info.get("duration") or 0),
+                             "url": info.get("webpage_url") or url, "uploader": ""}]}
+    entries = [e for e in (info.get("entries") or []) if e]
+    out = []
+    for i, e in enumerate(entries[:cap], 1):
+        try:
+            duration = float(e.get("duration") or 0)
+        except (TypeError, ValueError):
+            duration = 0.0
+        out.append({
+            "index": i,
+            "id": str(e.get("id") or ""),
+            "title": e.get("title") or f"第 {i} 条",
+            "duration": duration,
+            "url": _entry_url(e, info),
+            "uploader": e.get("uploader") or e.get("channel") or "",
+        })
+    total = info.get("playlist_count") or info.get("n_entries") or len(entries)
+    try:
+        total = int(total)
+    except (TypeError, ValueError):
+        total = len(entries)
+    return {
+        "title": info.get("title") or "",
+        "count": max(total, len(out)),
+        "truncated": total > len(out),
+        "entries": out,
+    }
+
+
+def playlist_source(target: str, python: str | None = None, limit: int = 500,
+                    listing: dict | None = None) -> "Source":
+    listing = listing or list_playlist(target, python, limit=limit)
+    if listing.get("single"):
+        raise RuntimeError("这个链接不是播放列表；直接按单个视频处理即可")
+    entries = listing["entries"]
+    if not entries:
+        raise RuntimeError("播放列表里没有可读取的条目")
+    flat = "".join(sanitize(e["id"], 24) for e in entries[:6]) or "playlist"
+    key = f"pl_{sanitize(flat, 40)}_{hashlib.sha1(target.encode('utf-8')).hexdigest()[:8]}"
+    meta = {
+        "bvid": key, "aid": 0, "cid": 0, "page": 1,
+        "platform": "playlist",
+        "video_id": key,
+        "title": listing.get("title") or "播放列表",
+        "desc": f"{listing['count']} 个条目",
+        "duration": sum(e["duration"] for e in entries),
+        "owner": "",
+        "tname": "",
+        "webpage_url": target,
+        "playlist": {
+            "count": listing["count"],
+            "truncated": listing.get("truncated", False),
+            "entries": entries,
+        },
+        "kind": "playlist",
+    }
+    return Source(kind="playlist", key=key, page=1, url=target, meta=meta, raw=listing)
 
 
 @dataclass

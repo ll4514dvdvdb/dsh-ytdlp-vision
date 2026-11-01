@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.0 — 2026-11-01
+
+两种新输入：整列视频，和硬盘上的文件。
+
+- **播放列表 / 合集**：target 换成播放列表链接（`/playlist?list=`、`/@频道/videos`、`space.bilibili.com/…/lists`、`/sets/` 等）会自动识别，不再偷偷只取第一条。
+  - `action=plan` 返回条目清单（序号、标题、时长、可单独使用的 url），清单缓存 24h，第二次取第 N 条是秒开。
+  - `index=N` 直接按第 N 条走完整分析（抽帧 + 字幕 + OCR）。
+  - `action=text` + `limit=N` 批量取前 N 条的字幕/转写，一次看完整列讲什么。
+  - 单个视频链接带 `&list=` 时默认仍只看当前视频，要整列处理得显式 `playlist=true`。
+- **本地视频文件**：target 给本机路径（绝对路径、相对路径、`file://` 都行，支持 mp4/mkv/webm/mov/flv/ts/m4v/avi/wmv/mpg/mpeg/ogv/3gp/m2ts/mts）。
+  - 不下载、不走网络：ffprobe 读时长和分辨率，抽帧直接读原文件，音轨用 PyAV 从容器里解，不用先转音频。
+  - 旁边有同名 `.srt` / `.vtt` / `.json3` 字幕就自动加载，不额外跑 ASR。
+  - 缓存目录按「文件名 + 路径哈希」隔离，同一文件重复分析命中缓存。
+- **修复**：`_bili_request` 对没有 `status_code` 的响应对象（单测 mock）会抛 `AttributeError`，改成 `getattr` 兜底。
+
 ## 0.5.0 — 2026-11-01
 
 面板从「每站填一堆字段」改成「点一下、登录、完事」。配置量从十几个输入框降到 0。

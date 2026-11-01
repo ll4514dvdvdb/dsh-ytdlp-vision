@@ -86,7 +86,7 @@ python -m pip install -r requirements.txt
 
 | 参数 | 类型 | 说明 |
 |---|---|---|
-| `target` | string，必填 | BV 号、B 站链接、b23.tv 短链，或任意 yt-dlp 支持的 URL |
+| `target` | string，必填 | BV 号、B 站链接、b23.tv 短链、任意 yt-dlp 支持的 URL、播放列表/合集链接，或本机视频文件路径 |
 | `action` | `inspect`（默认）/ `plan` / `text` / `frames` / `run` | 见下 |
 | `ask` | string | 你的问题，用于选帧相关度打分 |
 | `policy` | `auto` / `always` / `text` | `text` 只取文本证据，跳过所有画面处理 |
@@ -97,14 +97,47 @@ python -m pip install -r requirements.txt
 | `ocr` | boolean，默认 true | 对选中帧做 OCR |
 | `refresh` | boolean | 绕过缓存重算 |
 | `sessionData` | string | 覆盖 B 站 SESSDATA（一般用 env） |
+| `playlist` | boolean | 强制把 target 当播放列表；带 `&list=` 的单个视频链接默认只看当前视频 |
+| `index` | 1–9999 | 播放列表里的第几条，选中后按单条走完整分析 |
+| `limit` | 1–100，默认 10 | `action=text` 批量取字幕时的条数上限 |
 
 `action` 的区别：
 
 - `inspect`（推荐）：文本 + 全片覆盖 + 问题相关帧一起给，证据仍占当前模型 token，但没有额外 API 调用。
-- `text`：只要字幕/转写，不下载视频，最快最省。
-- `plan`：只算预算和选帧计划，不抽帧。
+- `text`：只要字幕/转写，不下载视频，最快最省。对播放列表用 `text` 会返回前 `limit` 条的字幕摘要。
+- `plan`：只算预算和选帧计划，不抽帧。对播放列表只返回条目清单。
 - `frames`：只抽帧，不做转录。
 - `run`：额外调用独立的视觉 API（需在 config 里配），成本另算。
+
+### 播放列表 / 合集
+
+链接带 `/playlist?list=`、`/@频道/videos`、`space.bilibili.com/…/lists`、`/sets/` 这类特征时自动识别成列表（`space.bilibili.com` 的 B 站合集也支持）。清单缓存 24 小时，所以第二次取第 N 条是秒开的。
+
+```
+# 先看有什么
+ytdlp_vision({ target: "https://www.youtube.com/@频道/videos", action: "plan" })
+
+# 分析第 3 条（完整抽帧 + 字幕）
+ytdlp_vision({ target: "...", index: 3 })
+
+# 整列讲什么：批量拿前 5 条字幕
+ytdlp_vision({ target: "...", action: "text", limit: 5 })
+```
+
+单个视频链接里带 `&list=` 时默认只看当前视频（多数人的意图），要整列处理传 `playlist: true`。
+
+### 本地视频文件
+
+`target` 直接给本机路径即可——绝对路径、相对路径、带引号、`file://` 都认，扩展名支持 mp4 / mkv / webm / mov / flv / ts / m4v / avi / wmv / mpg / mpeg / ogv / 3gp / m2ts / mts。
+
+- 不下载、不联网：ffprobe 读时长和分辨率，抽帧直接读原文件，音轨用 PyAV 从容器里解（不用先转音频）。
+- 旁边有同名 `.srt` / `.vtt` / `.json3` 字幕会自动加载，省掉 ASR。
+- 缓存目录按「文件名 + 路径哈希」隔离，同一个文件重复分析命中缓存。
+
+```
+ytdlp_vision({ target: "D:/recordings/meeting.mp4", action: "text" })
+ytdlp_vision({ target: "C:/videos/demo.mkv", ask: "演示了哪几步操作", start: 60, end: 180 })
+```
 
 ### `ytdlp_summary`
 

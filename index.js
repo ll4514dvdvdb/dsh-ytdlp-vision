@@ -137,7 +137,10 @@ async function imageRoute(ctx, exec) {
 
 const properties = {
   action: { type: 'string', enum: ['inspect', 'plan', 'text', 'frames', 'run'], description: '默认 inspect：把真实画面和文本交给当前 DSH 模型；plan 本地预算；run 额外调用独立 API。' },
-  target: { type: 'string', minLength: 1, description: '视频链接：B 站 BV 号/链接（支持 ?p=2）、YouTube、X/Twitter、Vimeo、抖音等 yt-dlp 支持的站点' },
+  target: { type: 'string', minLength: 1, description: '视频链接、播放列表/合集链接，或本机视频文件路径：B 站 BV 号/链接（支持 ?p=2）、YouTube、X/Twitter、Vimeo、抖音等 yt-dlp 支持的站点，以及 .mp4/.mkv/.webm/.mov 等本地文件' },
+  playlist: { type: 'boolean', description: '强制把 target 当播放列表。带 &list= 的单个视频链接默认只看当前视频，想整列处理时置 true' },
+  index: { type: 'integer', minimum: 1, maximum: 9999, description: '播放列表里的第几条（从 1 开始）。给了就按那一条单独分析' },
+  limit: { type: 'integer', minimum: 1, maximum: 100, description: 'action=text 批量取播放列表字幕时的条数上限，默认 10' },
   ask: { type: 'string', description: '当前问题，用于相关画面选择；应传入用户实际问题' },
   sessionData: { type: 'string', description: '可选 B 站 SESSDATA（仅 B 站有效），推荐配置 BILI_SESSDATA 环境变量' },
   policy: { type: 'string', enum: ['auto', 'always', 'text'], description: 'auto 全片覆盖+问题相关帧；always 全片均匀覆盖；text 跳过视频和视觉处理' },
@@ -195,8 +198,9 @@ export function apply(ctx, config = {}) {
     if (cap && (args.maxVision ?? 12) > cap * grid) args = { ...args, maxVision: cap * grid }
     python ??= findPython(config.python)
     const argv = [action, args.target.trim(), '--vision-policy', policy]
-    const options = { ask: '--ask', maxVision: '--max-vision', gridSize: '--grid-size', start: '--start', end: '--end', maxTextTokens: '--max-text-tokens' }
+    const options = { ask: '--ask', maxVision: '--max-vision', gridSize: '--grid-size', start: '--start', end: '--end', maxTextTokens: '--max-text-tokens', index: '--index', limit: '--limit' }
     for (const [key, flag] of Object.entries(options)) if (args[key] !== undefined) argv.push(flag, String(args[key]))
+    if (args.playlist) argv.push('--playlist')
     if (args.ocr === false) argv.push('--no-ocr')
     if (args.refresh) argv.push('--refresh')
     // Credentials stay out of the process command line.
