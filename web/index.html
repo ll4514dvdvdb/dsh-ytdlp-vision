@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>视频站 Cookie</title>
+		<link rel="stylesheet" href="app.css" />
+	</head>
+	<body>
+		<header class="topbar">
+			<div class="brand">
+				<span class="logo" aria-hidden="true">▶</span>
+				<div>
+					<h1>视频站 Cookie</h1>
+					<p class="sub" id="authority-line">正在读取配置…</p>
+				</div>
+			</div>
+			<div class="topbar-right">
+				<span class="pill" id="file-pill">cookies.txt</span>
+				<button class="ghost" id="btn-refresh" type="button">刷新</button>
+			</div>
+		</header>
+
+		<main class="grid">
+			<section class="card span-2 hint-card">
+				<h2>怎么用</h2>
+				<ol class="steps">
+					<li>只给需要的站点填。B 站最常用：登录后按 <kbd>F12</kbd> → Application → Cookies → <code>bilibili.com</code>，复制 <code>SESSDATA</code>（以及可选的 <code>bili_jct</code>、<code>buvid3</code>）。</li>
+					<li>也可以把浏览器里整串 <code>a=b; c=d</code> 粘到卡片下方的输入框，点「解析并填入」。</li>
+					<li>保存后立即生效：B 站走这里配置的登录态（1080P、CC 字幕、会员清晰度），其它站点由 yt-dlp 带着 <code>cookies.txt</code> 抓取。</li>
+				</ol>
+				<p class="warn-line">这些值是账号凭据，等同于你的登录状态。文件只存在本机（<code id="path-inline">…</code>，权限 0600），页面本身也只监听回环地址；不要截图外传，也不要把这个文件同步到网盘。</p>
+			</section>
+
+			<div id="sites" class="span-2 site-list"></div>
+
+			<section class="card" id="card-paste">
+				<h2>整串粘贴</h2>
+				<p class="hint">支持两种格式：浏览器里复制的 <code>name=value; name2=value2</code>，或 Netscape <code>cookies.txt</code> 的行。</p>
+				<textarea id="paste-input" rows="5" spellcheck="false" placeholder="SESSDATA=xxxx%2Cxxxx; bili_jct=yyyy; buvid3=zzzz"></textarea>
+				<div class="row">
+					<label class="field">
+						站点
+						<select id="paste-site"></select>
+					</label>
+					<button id="btn-parse" type="button">解析并填入</button>
+				</div>
+				<pre class="result" id="paste-result">等待粘贴…</pre>
+			</section>
+
+			<section class="card" id="card-browser">
+				<h2>从浏览器直接读</h2>
+				<p class="hint">开启后 yt-dlp 用 <code>--cookies-from-browser</code> 现场读取浏览器 cookie，不经过本文件（优先级高于下面的配置）。</p>
+				<div class="row">
+					<label class="field">
+						浏览器
+						<select id="browser-from">
+							<option value="off">不启用</option>
+							<option value="edge">Edge</option>
+							<option value="chrome">Chrome</option>
+							<option value="chromium">Chromium</option>
+							<option value="firefox">Firefox</option>
+							<option value="brave">Brave</option>
+							<option value="safari">Safari</option>
+						</select>
+					</label>
+					<button id="btn-browser" type="button">保存</button>
+				</div>
+				<p class="hint small">注意：Firefox 需要浏览器不在运行；Chromium 系在 Windows 上要用当前用户同一会话运行，否则读不到加密库。</p>
+			</section>
+
+			<section class="card" id="card-custom">
+				<h2>自定义站点</h2>
+				<p class="hint">预设里没有的站点在这里加：给一个短 id（如 <code>netease</code>）和它的 cookie 域。</p>
+				<div class="row">
+					<label class="field">
+						id
+						<input type="text" id="custom-id" placeholder="example" spellcheck="false" />
+					</label>
+					<label class="field">
+						cookie 域
+						<input type="text" id="custom-domain" placeholder=".example.com" spellcheck="false" />
+					</label>
+					<button id="btn-custom" type="button">添加</button>
+				</div>
+			</section>
+
+			<section class="card span-2" id="card-extra">
+				<h2>额外的 Netscape 行</h2>
+				<p class="hint">站点不在上面的预设里、或需要按域精确指定时用。每行 <code>domain  TRUE  /  TRUE  4070908800  name  value</code>，制表符分隔。</p>
+				<textarea id="extra-input" rows="4" spellcheck="false" placeholder=".example.com&#9;TRUE&#9;/&#9;TRUE&#9;4070908800&#9;session&#9;abc123"></textarea>
+				<div class="row">
+					<button id="btn-extra" type="button">保存</button>
+					<button class="ghost" id="btn-sync" type="button">立即生成 cookies.txt</button>
+					<span class="muted" id="sync-hint"></span>
+				</div>
+			</section>
+		</main>
+
+		<div class="toast" id="toast" hidden></div>
+		<script src="app.js"></script>
+	</body>
+</html>

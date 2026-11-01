@@ -18,6 +18,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+import cookies as vcookies  # noqa: E402  （同目录：统一管视频站 cookie）
 
 BILI_HOSTS = {"bilibili.com", "www.bilibili.com", "m.bilibili.com", "b23.tv"}
 BV_RE = re.compile(r"(BV[0-9A-Za-z]{10})")
@@ -120,7 +124,7 @@ class Source:
 
 def ytdlp_json(url: str, python: str | None = None, timeout: int = 180) -> dict:
     cmd = [*ytdlp_prefix(python), "-J", "--no-warnings", "--no-playlist",
-           "--no-progress", url]
+           "--no-progress", *vcookies.ytdlp_auth_args(), url]
     with _tmp_stderr_wrap():
         raw = run(cmd, timeout=timeout)
     # -J 输出到 stdout，run() 把 stderr 拼在后面；从第一个 { 开始找平衡的 JSON
@@ -360,6 +364,7 @@ def download_audio_ytdlp(src: Source, work: Path, python: str | None = None,
     try:
         run([*ytdlp_prefix(python), "-f", "bestaudio/best", "--no-warnings",
              "--no-playlist", "--no-progress", "--no-part",
+             *vcookies.ytdlp_auth_args(),
              "-o", str(dl / "audio.%(ext)s"), url], timeout=timeout)
     except Exception as exc:  # noqa: BLE001
         log(f"音频下载失败：{exc}")
@@ -379,7 +384,8 @@ def download_video_ytdlp(src: Source, work: Path, height: int = 720,
     log(f"yt-dlp 下载视频（≤{height}p）：{url}")
     try:
         run([*ytdlp_prefix(python), "-f", fmt, "--no-warnings", "--no-playlist",
-             "--no-progress", "--no-part", "-o", str(dl / "video.%(ext)s"), url],
+             "--no-progress", "--no-part", *vcookies.ytdlp_auth_args(),
+             "-o", str(dl / "video.%(ext)s"), url],
             timeout=timeout)
     except Exception as exc:  # noqa: BLE001
         log(f"视频下载失败：{exc}")

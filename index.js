@@ -13,6 +13,10 @@ const UPDATE_PY = join(HERE, 'update.py')
 export const name = 'ytdlp-vision'
 export const inject = ['tools']
 
+// Cookie 面板：数据层给 Python 侧共用同一份 cookies.json。
+import { createPanelRoute } from './panel/routes.js'
+import { CookieStore } from './panel/store.js'
+
 // Register native JSON Schema directly. No dependency discovery or identity fallback.
 const output = {
   schema: {
@@ -231,4 +235,16 @@ export function apply(ctx, config = {}) {
       return invoke({ ...args, action: 'text', policy: 'text' }, exec)
     },
   })
+
+  // Cookie 面板：同源页面 /ytdlp-vision-panel/，数据层与 Python 侧共用同一份 cookies.json。
+  // 属于可选能力：精简宿主或单测环境没有 ctx.inject 时跳过，核心工具照常可用。
+  if (typeof ctx.inject === 'function') {
+    const store = new CookieStore()
+    ctx.inject(['webServer'], (sctx) => {
+      sctx.effect(() => {
+        const dispose = sctx.webServer.register(createPanelRoute(store))
+        return () => dispose?.()
+      }, 'ytdlp-vision: cookie panel')
+    })
+  }
 }

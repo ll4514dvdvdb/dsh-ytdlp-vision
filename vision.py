@@ -29,6 +29,7 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
+import cookies as vcookies  # noqa: E402
 import sources as vidsrc  # noqa: E402  （同目录模块，必须在 sys.path 之后导入）
 
 # ---------------------------------------------------------------- 常量
@@ -217,9 +218,11 @@ def _api(path: str, params: dict, cookie: str = "") -> dict:
 
 
 def _cookie() -> str:
-    """本地补丁：playurl 也带上登录态，否则匿名只拿到 480P。"""
-    sess = os.environ.get("BILI_SESSDATA", "").strip()
-    return f"SESSDATA={sess}" if sess else ""
+    """登录态：面板里配置的 cookie 优先（含 SESSDATA/bili_jct 等），环境变量兜底。
+
+    没有登录态时 playurl 只给 480P，字幕接口也基本返回空。
+    """
+    return vcookies.bili_cookie()
 
 
 def fetch_meta(bvid: str, page: int = 1) -> dict:
@@ -244,7 +247,7 @@ def fetch_subtitle(bvid: str, cid: int, sessdata: str) -> list[dict] | None:
         return None
     import requests
     h = {"User-Agent": UA, "Referer": f"https://www.bilibili.com/video/{bvid}/",
-         "Cookie": f"SESSDATA={sessdata}"}
+         "Cookie": vcookies.bili_cookie() or f"SESSDATA={sessdata}"}
     try:
         j = _bili_request('get', "https://api.bilibili.com/x/player/v2",
                           params={"bvid": bvid, "cid": cid},
@@ -694,7 +697,7 @@ def prepare(args, source: vidsrc.Source | None = None) -> Ctx:
     text_only=args.cmd=='text' or args.vision_policy=='text' or args.subtitle_only
     need_visual=not (args.no_video or text_only)
     need_speech=not (args.no_asr or args.subtitle_only or args.cmd=='frames')
-    sessdata=args.sessdata or os.environ.get('BILI_SESSDATA','')
+    sessdata=args.sessdata or vcookies.sessdata()
     if args.cmd!='frames':
         sub_path=work/'subtitle.json'
         cached=load_json(sub_path)

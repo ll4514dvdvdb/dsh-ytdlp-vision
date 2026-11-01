@@ -14,6 +14,7 @@
 | B 站抓取 | 官方 API（SESSDATA、1080P 选流） | **保留**，同一套实现 |
 | 其他平台 | 不支持 | yt-dlp 抓元数据 / 字幕 / 音视频 |
 | yt-dlp 版本 | — | 包内自带 + 每次启动后台自动更新 |
+| cookie 配置 | 只能设环境变量 | **自带可视化页面**，多站点、可验证登录 |
 | 工具名 | `bili_vision` / `bili_summary` | `ytdlp_vision` / `ytdlp_summary` |
 
 本插件**完全替代** bili-vision：先卸旧的再装这个，两个不要同时挂载。
@@ -46,7 +47,7 @@ target ──┬─ B 站（BV 号 / bilibili.com / b23.tv）
 
 ```powershell
 # 1. 取包（或用 git clone https://github.com/ll4514dvdvdb/dsh-ytdlp-vision）
-curl -L -o ytdlp-vision.zip https://github.com/ll4514dvdvdb/dsh-ytdlp-vision/releases/download/v0.3.0/ytdlp-vision-0.3.0.zip
+curl -L -o ytdlp-vision.zip https://github.com/ll4514dvdvdb/dsh-ytdlp-vision/releases/download/v0.4.0/ytdlp-vision-0.4.0.zip
 Expand-Archive ytdlp-vision.zip -DestinationPath "$env:USERPROFILE\.dsh\ytdlp-vision-src" -Force
 
 # 2. 装 Python 依赖（用 DSH 自带解释器或任意 3.10+）
@@ -109,6 +110,40 @@ python -m pip install -r requirements.txt
 
 等价于 `ytdlp_vision` + `action: "text"`，纯文本摘要入口。
 
+此外提供一个**可视化的 cookie 配置页面**（侧栏「视频 Cookie」），见下一节。
+
+---
+
+## Cookie 配置页面
+
+登录墙、年龄限制、会员视频需要 cookie。插件自带一个同源页面，不用改环境变量、不用手搓 Netscape 文件。
+
+打开方式：侧栏图标「视频 Cookie」，或直接访问 `http://<GUI 地址>/ytdlp-vision-panel/`（只在 loopback 上应答）。
+
+**能做什么**
+
+| 功能 | 说明 |
+|---|---|
+| 分站点填 cookie | 预置 B 站 / YouTube / X / Vimeo / 抖音；每站点有独立开关 |
+| 整串粘贴解析 | 从浏览器复制 `SESSDATA=xxx; bili_jct=yyy` 或整行 Netscape，粘贴后自动拆成字段 |
+| 验证登录（B 站） | 调 `x/web-interface/nav` 实测 SESSDATA 是否有效，直接显示昵称和等级 |
+| 浏览器直读 | 让 yt-dlp 用 `--cookies-from-browser edge`（或 chrome/firefox…）现场读浏览器库，不落盘 |
+| 自定义站点 | 预设之外的站点，给个 id 和 cookie 域即可 |
+| 额外 Netscape 行 | 手写补充行，原样并入 `cookies.txt` |
+| 同步 | 生成 `~/.dsh/ytdlp-vision/cookies.txt`，yt-dlp 抓取时自动带 `--cookies` |
+
+**存储与权限**
+
+- 配置：`~/.dsh/ytdlp-vision/cookies.json`（权限 0600）
+- 生成物：同目录 `cookies.txt`（0600，含 `# Netscape HTTP Cookie File` 头，过期时间写死远期）
+- 页面只返回**脱敏视图**（`abcd…wxyz`），明文值永远不离开本地进程
+- HTTP 面：只认 loopback 源地址；所有 API 要求自定义头 `x-ytdlp-vision`（跨站页面带不上它，也不实现预检）
+- 优先级：面板配置 > `BILI_VISION_SESSDATA` 环境变量 > 无
+
+**B 站走官方 API，其余走 yt-dlp**：面板里 B 站的字段直接拼成请求头给 `api.bilibili.com`；其他站点写进 `cookies.txt` 交给 yt-dlp。选了「浏览器直读」时 yt-dlp 优先用 `--cookies-from-browser`，B 站仍然用面板里的字段。
+
+> cookie 等同于账号登录凭证。不要把 `cookies.json` / `cookies.txt` 提交到仓库、发到聊天里或截图外传。
+
 ---
 
 ## yt-dlp 自动更新
@@ -145,6 +180,8 @@ python scripts/fetch-ytdlp.py     # 直接把最新版拉进 vendor/
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `YTDLP_VISION_CACHE` | `~/.dsh/ytdlp-vision-cache` | 缓存根目录 |
+| `YTDLP_VISION_HOME` | `~/.dsh/ytdlp-vision` | cookie 配置、`cookies.txt`、yt-dlp 更新产物的目录 |
+| `YTDLP_VISION_PROXY` | 空 | 自更新下载用的代理；空则读 `HTTPS_PROXY` / `ALL_PROXY` |
 | `YTDLP_VISION_PYTHON` | 自动探测 | 指定解释器 |
 | `YTDLP_VISION_ASR_MODEL` | `small` | faster-whisper 模型（`base` 约 14× 实时，`small` 约 3×） |
 | `YTDLP_VISION_ASR_DEVICE` | `cpu` | 有 N 卡可设 `cuda` |
@@ -172,7 +209,7 @@ python scripts/fetch-ytdlp.py     # 直接把最新版拉进 vendor/
 
 ## 已知限制
 
-- 登录墙内容（B 站充电视频、YouTube 会员）拿不到，除非提供对应 cookie。
+- 登录墙内容（B 站充电视频、YouTube 会员）需要 cookie：用「视频 Cookie」页面填，或设 `BILI_VISION_SESSDATA`。
 - yt-dlp 从 B 站抓会 412，所以 B 站永远走官方 API；这意味着 B 站之外的国内站点（如部分短视频平台）能否用取决于 yt-dlp 当日支持情况。
 - `run` 模式要额外配独立视觉 API，不配就只用当前模型。
 - ASR 在 CPU 上慢（`small` 约 3× 实时），长视频建议先看有没有字幕。

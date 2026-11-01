@@ -1,28 +1,33 @@
 {
   "name": "ytdlp-vision",
-  "version": "0.3.0",
-  "description": "DSH 多平台视频证据插件：B 站走官方 API，其余站点交给 yt-dlp（1800+ 平台）；带时间戳画面、字幕/ASR 与 OCR 原生返回当前视觉模型，按需细看、缓存和可选独立 API；启动时自动更新 yt-dlp",
+  "version": "0.4.0",
+  "description": "DSH 多平台视频证据插件：B 站走官方 API，其余站点交给 yt-dlp（1800+ 平台）；带时间戳画面、字幕/ASR 与 OCR 原生返回当前视觉模型，按需细看、缓存和可选独立 API；启动时自动更新 yt-dlp；自带 cookie 配置页面",
   "type": "module",
   "main": "index.js",
   "exports": {
     ".": "./index.js",
+    "./client": "./client.js",
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json"
   },
   "author": "icyaaaww",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/icyaaaww/dsh-bili-vision.git"
+    "url": "git+https://github.com/ll4514dvdvdb/dsh-ytdlp-vision.git"
   },
-  "homepage": "https://github.com/icyaaaww/dsh-bili-vision#readme",
+  "homepage": "https://github.com/ll4514dvdvdb/dsh-ytdlp-vision#readme",
   "bugs": {
-    "url": "https://github.com/icyaaaww/dsh-bili-vision/issues"
+    "url": "https://github.com/ll4514dvdvdb/dsh-ytdlp-vision/issues"
   },
   "files": [
     "index.js",
+    "client.js",
     "vision.py",
     "sources.py",
+    "cookies.py",
     "update.py",
+    "panel/*.js",
+    "web/*",
     "cordis.patch.yml",
     "README.md",
     "requirements.txt",
@@ -39,6 +44,14 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ],
+      "platform": "web"
     }
   },
   "keywords": [

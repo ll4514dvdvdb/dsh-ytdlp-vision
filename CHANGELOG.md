@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.0 — 2026-11-01
+
+新增可视化 cookie 配置页面，登录态配置不再依赖环境变量。
+
+- **面板**：`client.js` 注册侧栏入口（order 31）与对话视图标签（order 41），页面本体是同源 iframe `/ytdlp-vision-panel/`，由插件的 `webServer` 前缀路由提供（`panel/routes.js`）。不引入构建步骤，页面就是普通 HTML/CSS/JS。
+- **多站点**：B 站 / YouTube / X / Vimeo / 抖音预置字段，外加自定义站点（任意 id + cookie 域）。每站点独立开关，关掉即不写入 `cookies.txt`。
+- **整串粘贴**：同时解析 `a=b; c=d` 与 Netscape 制表符行，一次写入多个字段。
+- **B 站验证登录**：`POST /test` 调 `x/web-interface/nav` 实测 SESSDATA，返回昵称与等级；直连被风控时给出明确提示。
+- **浏览器直读**：可选 `--cookies-from-browser edge|chrome|chromium|firefox|brave|safari|off`，此时 yt-dlp 现场读浏览器库，不落盘。
+- **存储**：`~/.dsh/ytdlp-vision/cookies.json`（0600）由 Node 写、Python `cookies.py` 读，两侧共用同一份格式；`cookies.txt` 由任一方向生成，带 sha256 陈旧检测，内容不变不重写。
+- **安全**：页面只拿到脱敏值（`abcd…wxyz`）；路由只认 loopback 源地址，API 要求自定义头 `x-ytdlp-vision`；`cookies.json` / `cookies.txt` 均 0600。
+- **接入**：`vision.py` 的 `_cookie()` 改为 `cookies.bili_cookie()`，面板配置优先于 `BILI_SESSDATA`；`sources.py` 的 `ytdlp_json` / `download_audio_ytdlp` / `download_video_ytdlp` 都追加 `cookies.ytdlp_auth_args()`。
+- **packaging**：`package.json` 增加 `exports["./client"]`、`dsh.client`（inject locale/layout/sidebar，platform web），`files` 收录 `client.js` / `panel/` / `web/`。
+
+实测：面板页面渲染、站点保存、整串解析、B 站登录校验（无效 SESSDATA 正确返回 `-101 账号未登录`）、`cookies.txt` 生成、浏览器直读切换、自定义站点添加均通过；`yt-dlp --cookies <生成文件>` 抓 YouTube 正常。
+
+> 升级说明：0.4.0 新增了客户端 bundle 与 HTTP 路由，升级后必须**完全退出并重开 DSH**（HMR 不会重新挂载 `webServer` 路由）。
+
+Tested host: DSH 0.2.1-rc.3 on Windows 11, Python 3.12.14。其他宿主版本与操作系统需自行验证。
+
 ## 0.3.0 — 2026-11-01
 
 从 `bili-vision` 0.2.0 分叉扩展为多平台插件，包名与工具名改为 `ytdlp-vision` / `ytdlp_vision` / `ytdlp_summary`。

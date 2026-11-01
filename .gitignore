@@ -3,6 +3,9 @@ __pycache__/
 .tmp/
 .test-cache/
 .test-home/
+.test-panel-home/
+.test-cookie-home/
 .probe/
 .test-*.txt
 *.log
+tmp*/
