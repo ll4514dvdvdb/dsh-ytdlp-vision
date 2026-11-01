@@ -42,6 +42,24 @@ target ──┬─ B 站（BV 号 / bilibili.com / b23.tv）
 
 ---
 
+## 安装
+
+```powershell
+# 1. 取包（或用 git clone https://github.com/ll4514dvdvdb/dsh-ytdlp-vision）
+curl -L -o ytdlp-vision.zip https://github.com/ll4514dvdvdb/dsh-ytdlp-vision/releases/download/v0.3.0/ytdlp-vision-0.3.0.zip
+Expand-Archive ytdlp-vision.zip -DestinationPath "$env:USERPROFILE\.dsh\ytdlp-vision-src" -Force
+
+# 2. 装 Python 依赖（用 DSH 自带解释器或任意 3.10+）
+& "$env:USERPROFILE\.dsh\bili-vision-venv\Scripts\python.exe" -m pip install -r "$env:USERPROFILE\.dsh\ytdlp-vision-src\requirements.txt"
+
+# 3. 注册进 profile，然后完全退出重开 DSH
+& "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add "file:$env:USERPROFILE\.dsh\ytdlp-vision-src"
+```
+
+装好后工具名是 `ytdlp_vision` / `ytdlp_summary`。**不要和 `bili-vision` 同时装**，两者注册的是同一套能力。
+
+> 本插件为个人自用改造版，上游 `bili-vision` 的 B 站抓取代码沿用其实现；未经原作者审阅。使用前请自行确认目标站点的服务条款与当地法律。
+
 ## 依赖
 
 | 依赖 | 说明 |
