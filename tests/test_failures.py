@@ -123,7 +123,10 @@ class DiskAndBinaryTests(unittest.TestCase):
     def test_probe_local_propagates_ffprobe_error(self):
         def broken(cmd, **_kw):
             raise FileNotFoundError('ffprobe 不存在')
-        with mock.patch.object(vision, 'run', side_effect=broken):
+        # 显式把 fp() 换成假路径：CI 机器上没有 ffprobe，不 patch 的话
+        # probe_local 会先撞 fp() 的 SystemExit，测不到「run 失败要传播」。
+        with mock.patch.object(vision, 'fp', return_value='ffprobe'), \
+                mock.patch.object(vision, 'run', side_effect=broken):
             with self.assertRaises(FileNotFoundError):
                 vision.probe_local(Path('nope.mp4'))
 

@@ -1,0 +1,19 @@
+# 需要字节稳定的文件：Git 在 Windows 上默认会把 LF 转成 CRLF，
+# 而 update.py 里钉死了公钥的 sha256（PUBKEY_SHA256），转换后校验必定失败
+# → verify_signature() 永远返回「包内公钥与钉死的哈希不一致」。
+# SHA2-256SUMS 同理：签名是对这份文件的原始字节做的，CRLF 会破坏验签。
+vendor/yt-dlp-public.key -text
+vendor/SHA2-256SUMS binary
+vendor/SHA2-512SUMS binary
+vendor/yt-dlp-py.zip binary
+
+# 脚本与配置固定 LF，避免不同平台 checkout 出两份 diff
+*.py text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.toml text eol=lf
