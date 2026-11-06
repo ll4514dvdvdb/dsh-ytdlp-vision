@@ -1,6 +1,6 @@
 {
   "name": "ytdlp-vision",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "DSH 多平台视频证据插件：B 站走官方 API，其余站点交给 yt-dlp（1800+ 平台），也能直接读本机视频文件；支持播放列表/合集批量；带时间戳画面、字幕/ASR 与 OCR 原生返回当前视觉模型，按需细看、缓存和可选独立 API；启动时自动更新 yt-dlp；自带 cookie 配置页面",
   "type": "module",
   "main": "index.js",

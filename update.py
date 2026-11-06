@@ -46,7 +46,10 @@ RELEASE_BASE = "https://github.com/yt-dlp/yt-dlp/releases/download/{tag}/{name}"
 PUBKEY_SHA256 = "45d6b415928b5f3e228b461fa9e6d7eb56a824931c785ece00279a06c7a6d6e5"
 
 API_HOSTS = ("api.github.com",)
-RELEASE_HOSTS = ("github.com", "objects.githubusercontent.com")
+# GitHub 自 2025 年起把 release 资产的 302 目标改成 release-assets.githubusercontent.com；
+# objects.githubusercontent.com 是旧域名，仍保留以兼容未切换的账号/镜像。
+RELEASE_HOSTS = ("github.com", "release-assets.githubusercontent.com",
+                 "objects.githubusercontent.com")
 WEB_HOSTS = ("github.com",)
 
 TAG_RE = re.compile(r"^\d{4}\.\d{2}\.\d{2}(?:\.\d{1,6})?$")
@@ -214,29 +217,60 @@ def verify_signature(requests, tag: str, sums_bytes: bytes, px) -> str:
     except Exception as exc:  # noqa: BLE001 - 验签是加分项，不阻塞更新
         return f"skipped: 下载签名失败（{exc.__class__.__name__}）"
     try:
-        with tempfile.TemporaryDirectory(prefix="ytdlp-vision-gpg-") as tmp:
-            home = Path(tmp)
-            (home / "pub.key").write_bytes(key_bytes)
-            (home / "sums").write_bytes(sums_bytes)
-            (home / "sums.sig").write_bytes(sig)
-            env = {**os.environ, "GNUPGHOME": str(home / "gnupg")}
-            (home / "gnupg").mkdir(mode=0o700)
-            keyring = ["--no-default-keyring", "--keyring", str(home / "gnupg" / "pubring.kbx")]
-            subprocess.run([gpg, "--batch", "--quiet", *keyring, "--import", str(home / "pub.key")],
-                           env=env, timeout=90, check=True,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            proc = subprocess.run([gpg, "--batch", "--quiet", *keyring, "--verify",
-                                   str(home / "sums.sig"), str(home / "sums")],
-                                  env=env, timeout=90, capture_output=True,
-                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            if proc.returncode != 0:
-                return "failed: 签名校验不通过"
-            return "ok"
+        # 临时目录放在 HOME 下而不是 %TEMP%：受限环境（服务账号、精简系统、组策略）
+        # 下 %TEMP% 可能不可写，那会让验签永远 skipped。
+        # 也不用 tempfile.mkdtemp：它按 0o700 建目录，在带沙箱/过滤驱动的环境里
+        # 建出来就是不可写目录（实测 PermissionError），普通 mkdir 反而正常。
+        HOME.mkdir(parents=True, exist_ok=True)
+        tmp = HOME / f"gpg-{os.getpid()}-{time.time_ns()}"
+        tmp.mkdir()
+    except OSError as exc:
+        return f"skipped: 建不了临时目录（{exc.__class__.__name__}）"
+    try:
+        home = tmp
+        (home / "pub.key").write_bytes(key_bytes)
+        (home / "sums").write_bytes(sums_bytes)
+        (home / "sums.sig").write_bytes(sig)
+        (home / "gnupg").mkdir()
+        if os.name != "nt":
+            # Windows 上 mkdir(mode=0o700) 会触发 chmod，受限环境里直接被拒绝（WinError 5）；
+            # NTFS 权限由用户目录继承保证，这里只在 POSIX 上收紧。
+            os.chmod(home / "gnupg", 0o700)
+        # 全部用相对名 + cwd=home：Git for Windows 自带的是 MSYS 版 gpg，
+        # 它把 "C:\..." 当成相对 POSIX 路径甚至资源 URL 解析，绝对路径会直接失效
+        # （实测：gpg: invalid key resource URL / no writable keyring found）。
+        # 在临时目录内用相对路径就绕开了盘符问题，隔离仍由独立 GNUPGHOME 保证。
+        env = {**os.environ, "GNUPGHOME": "gnupg"}
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.run([gpg, "--batch", "--quiet", "--import", "pub.key"],
+                       cwd=home, env=env, timeout=90, check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                       creationflags=flags)
+        proc = subprocess.run([gpg, "--batch", "--quiet", "--verify", "sums.sig", "sums"],
+                              cwd=home, env=env, timeout=90, capture_output=True,
+                              creationflags=flags)
+        if proc.returncode != 0:
+            detail = _stderr_tail(proc.stderr)
+            return f"failed: 签名校验不通过（gpg {proc.returncode}）{('：' + detail) if detail else ''}"
+        return "ok"
+    except subprocess.CalledProcessError as exc:
+        detail = _stderr_tail(exc.stderr)
+        return f"skipped: gpg 执行失败（{exc.returncode}）{('：' + detail) if detail else ''}"
     except subprocess.TimeoutExpired:
         return "skipped: gpg 超时"
     except Exception as exc:  # noqa: BLE001
         return f"skipped: gpg 执行失败（{exc.__class__.__name__}）"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _stderr_tail(raw, limit: int = 300) -> str:
+    """把子进程 stderr 压成一行，供日志/返回值使用。"""
+    if not raw:
+        return ""
+    text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+    text = " ".join(text.split())
+    return text[-limit:]
 
 
 def download_asset(requests, url: str, dest: Path, px, retries: int = 5,

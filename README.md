@@ -47,7 +47,7 @@ target ──┬─ B 站（BV 号 / bilibili.com / b23.tv）
 
 ```powershell
 # 1. 取包（或用 git clone https://github.com/ll4514dvdvdb/dsh-ytdlp-vision）
-curl -L -o ytdlp-vision.zip https://github.com/ll4514dvdvdb/dsh-ytdlp-vision/releases/download/v0.7.0/ytdlp-vision-0.7.0.zip
+curl -L -o ytdlp-vision.zip https://github.com/ll4514dvdvdb/dsh-ytdlp-vision/releases/download/v0.7.1/ytdlp-vision-0.7.1.zip
 Expand-Archive ytdlp-vision.zip -DestinationPath "$env:USERPROFILE\.dsh\ytdlp-vision-src" -Force
 
 # 2. 装 Python 依赖（用 DSH 自带解释器或任意 3.10+）

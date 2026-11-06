@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.7.1 — 2026-11-06
+
+0.7.0 发布后第一次跑 GitHub Actions 暴露出来的问题，加上真机验证自动更新的 GPG 验签。
+
+**自动更新（`update.py`）**
+- 修：GitHub 已经把 release 资产的 302 目标换成了 `release-assets.githubusercontent.com`，白名单里只有 `github.com` 和 `objects.githubusercontent.com`，导致真实环境下每次更新都报「拒绝非可信主机」。现在把新域名加入白名单，旧域名保留兼容（`update.py` `RELEASE_HOSTS`）。这是纯离线单测测不出来的问题——假请求不会真的重定向。
+- 修：GPG 验签在 Windows 上从来没成功过。Git for Windows 自带的是 MSYS 版 gpg，它把 `--keyring "C:\..."` 当成资源 URL 解析（`gpg: invalid key resource URL`），把 `GNUPGHOME=C:\...` 当成相对 POSIX 路径。现在改成在临时目录里用**相对文件名 + `cwd`**，`GNUPGHOME="gnupg"`，并去掉多余的 `--no-default-keyring/--keyring`（隔离本来就由独立 `GNUPGHOME` 保证）。
+- 修：验签失败时只返回「gpg 执行失败」，看不到原因。现在带上 gpg 的 stderr 末尾（压成单行）。
+- 修：临时目录不再用 `tempfile.mkdtemp()`，改为在 `~/.dsh/ytdlp-vision/` 下建 `gpg-<pid>-<时间戳>/`。原因是受限环境里 `%TEMP%` 可能不可写，而 `mkdtemp` 按 `0o700` 建出来的目录在带过滤驱动的环境里连自己都写不进去（实测 `PermissionError`）。
+
+**依赖与 CI**
+- `requirements.txt`: `Pillow>=10.1,<13` → `<14`。`pip-audit` 报 Pillow 12.3.0 有 21 条漏洞，修复版是 13.0.0，而原上界把修复版挡住了。已用 Pillow 13.0.0 跑通全部 27 项 pipeline 测试（`gridify()` 用到的 API 无变化）。
+- `.github/workflows/ci.yml`: Python 测试步骤补装 `requests`、`numpy`。原来只装 `Pillow`，导致 4 项测试在 CI 上报 `ModuleNotFoundError`。
+
+**测试**
+- `tests/test_update.py` 新增 6 项：`release-assets` 重定向、验签成功、验签失败带原因、公钥导入失败、没有 gpg、包内公钥被篡改后不调用 gpg。Python 测试从 78 项增到 84 项。
+
+实测：`python -m unittest discover` 84 项通过、`ruff check .` 无告警；真实网络下 `verify_signature()` 对官方 `SHA2-256SUMS` 返回 `ok`，篡改后返回 `failed` 并带 `BAD signature`。
+
 ## 0.7.0 — 2026-11-06
 
 安全与可靠性加固。功能没删，配置格式没变（`cookies.json` 仍是 v2，旧文件直接可用）。

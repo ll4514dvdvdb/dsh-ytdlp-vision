@@ -197,6 +197,19 @@ class UpdateSafetyTests(UpdateTestBase):
         self.assertEqual(state["tag"], "2026.10.26")
         self.assertEqual(state["sha256"], hashlib.sha256(payload).hexdigest())
 
+    def test_redirect_to_release_assets_host_is_followed(self):
+        # 2026-11 实测：GitHub release 资产的 302 目标是 release-assets.githubusercontent.com。
+        # 这个域名必须留在白名单里，否则真实自动更新会报「拒绝非可信主机」。
+        payload = NEW
+        fake = FakeRequests({
+            update.API: lambda url, kw: self.api_release(),
+            self.sums_url(): FakeResp(302, b"", {"location": "https://release-assets.githubusercontent.com/sums"}),
+            "https://release-assets.githubusercontent.com/sums": self.sums_for(payload),
+            self.asset_url(): FakeResp(200, payload, {"content-length": str(len(payload))}),
+        })
+        update.run_update(fake.module, force=True, quiet=True)
+        self.assertEqual(self.target.read_bytes(), payload)
+
     def test_no_update_needed_does_not_touch_binary(self):
         update.write_state({"tag": "2026.10.26", "sha256": hashlib.sha256(OLD).hexdigest()})
         fake = FakeRequests({update.API: lambda url, kw: self.api_release()})
@@ -214,6 +227,106 @@ class UpdateSafetyTests(UpdateTestBase):
         })
         update.run_update(fake.module, force=True, quiet=True)
         self.assertEqual(self.target.read_bytes(), payload)
+
+
+class SignatureTests(UpdateTestBase):
+    """GPG 验签分支：用假的 subprocess.run，不依赖本机是否装了 gpg。
+
+    这里的断言来自一次真实的失败：Git for Windows 自带 MSYS 版 gpg，
+    传 `--keyring C:\\...` 会被当成资源 URL 解析（invalid key resource URL）。
+    所以固定要求：不出现 --keyring，且把 cwd 设为临时目录、全程用相对文件名。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._which.stop()
+        self._which = mock.patch.object(
+            update.shutil, "which",
+            lambda name: r"C:\fake\gpg.exe" if name == "gpg" else None)
+        self._which.start()
+        self.calls = []
+        self.verify_rc = 0
+        self.verify_err = b""
+        self._run = mock.patch.object(update.subprocess, "run", self._fake_run)
+        self._run.start()
+
+    def tearDown(self):
+        self._run.stop()
+        super().tearDown()
+
+    def _fake_run(self, cmd, **kwargs):
+        self.calls.append((list(cmd), dict(kwargs)))
+
+        class Result:
+            def __init__(self, returncode, stderr):
+                self.returncode = returncode
+                self.stdout = b""
+                self.stderr = stderr
+
+        if "--import" in cmd:
+            return Result(0, b"")
+        return Result(self.verify_rc, self.verify_err)
+
+    def _sig_url(self, tag="2026.10.26"):
+        return update.RELEASE_BASE.format(tag=tag, name="SHA2-256SUMS.sig")
+
+    def test_signature_ok_when_gpg_accepts(self):
+        fake = FakeRequests({self._sig_url(): FakeResp(200, b"FAKE-SIG")})
+        status = update.verify_signature(fake.module, "2026.10.26", b"sums-bytes", px=None)
+        self.assertEqual(status, "ok")
+        self.assertEqual(len(self.calls), 2, "应当是先 import 再 verify")
+        import_cmd = self.calls[0][0]
+        verify_cmd = self.calls[1][0]
+        self.assertIn("--import", import_cmd)
+        self.assertIn("pub.key", import_cmd)
+        self.assertIn("--verify", verify_cmd)
+        self.assertIn("sums.sig", verify_cmd)
+        self.assertIn("sums", verify_cmd)
+        for cmd, _ in self.calls:
+            self.assertNotIn("--keyring", cmd, "MSYS 版 gpg 不接受 Windows 绝对路径的 --keyring")
+            self.assertNotIn("--no-default-keyring", cmd)
+        for _, kwargs in self.calls:
+            self.assertTrue(Path(kwargs["cwd"]).name.startswith("gpg-"), "临时目录要在 HOME 下，不依赖 %TEMP%")
+            self.assertEqual(kwargs["env"]["GNUPGHOME"], "gnupg", "隔离靠独立 GNUPGHOME，且必须是相对名")
+
+    def test_signature_failure_reports_gpg_detail(self):
+        self.verify_rc = 1
+        self.verify_err = (
+            b"gpg: Signature made Tue Oct 27 06:24:41 2026\r\n"
+            b'gpg: BAD signature from "Simon Sawicki (yt-dlp signing key)"\r\n'
+        )
+        fake = FakeRequests({self._sig_url(): FakeResp(200, b"BAD-SIG")})
+        status = update.verify_signature(fake.module, "2026.10.26", b"sums-bytes", px=None)
+        self.assertTrue(status.startswith("failed:"), status)
+        self.assertIn("BAD signature", status, "失败原因要带出来，否则用户无法定位")
+        self.assertNotIn("\n", status, "返回值必须是单行")
+
+    def test_import_failure_is_reported_as_skipped(self):
+        def boom(cmd, **kwargs):
+            raise update.subprocess.CalledProcessError(2, cmd, stderr=b"gpg: no writable keyring found")
+
+        with mock.patch.object(update.subprocess, "run", boom):
+            fake = FakeRequests({self._sig_url(): FakeResp(200, b"SIG")})
+            status = update.verify_signature(fake.module, "2026.10.26", b"sums-bytes", px=None)
+        self.assertTrue(status.startswith("skipped:"), status)
+        self.assertIn("no writable keyring", status)
+
+    def test_missing_gpg_is_skipped(self):
+        with mock.patch.object(update.shutil, "which", lambda name: None):
+            fake = FakeRequests({})
+            self.assertEqual(
+                update.verify_signature(fake.module, "2026.10.26", b"sums", px=None),
+                "skipped: gpg 不在 PATH")
+
+    def test_tampered_pubkey_is_rejected_before_gpg_runs(self):
+        bogus = pubkey = update.PUBKEY.read_bytes() + b"tampered"
+        with mock.patch.object(update, "PUBKEY", self._tmp / "vendor.key"):
+            (self._tmp / "vendor.key").write_bytes(bogus)
+            fake = FakeRequests({})
+            status = update.verify_signature(fake.module, "2026.10.26", b"sums", px=None)
+        self.assertEqual(status, "skipped: 包内公钥与钉死的哈希不一致")
+        self.assertEqual(self.calls, [], "公钥不可信时不应调用 gpg")
+        self.assertTrue(pubkey)
 
 
 if __name__ == "__main__":
