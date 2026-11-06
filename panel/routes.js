@@ -197,6 +197,14 @@ export function createPanelRoute(store, grabber = null) {
 
 		"POST sync": async () => ({ state: await store.state(), file: await store.writeNetscape() }),
 
+		// 导出是用户显式点按钮才发生的一次性响应；明文只在这一个响应体里出现，
+		// 不进日志、不进 state、不缓存。
+		"POST export": async () => {
+			const { text, rows } = await store.exportNetscape();
+			if (rows === 0) throw new Error("没有已启用的 cookie 可导出");
+			return { text, rows, name: `ytdlp-vision-cookies-${new Date().toISOString().slice(0, 10)}.txt` };
+		},
+
 		"POST test": async (body) => {
 			const id = String(body.id ?? "");
 			if (id === "bilibili") {

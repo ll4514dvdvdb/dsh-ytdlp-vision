@@ -1,0 +1,23 @@
+# ruff 配置：只作为「静态错误检查」用，不当风格检查器。
+#
+# 选中的规则集：
+#   F   pyflakes      —— 未使用导入/变量、未定义名、重复定义（真会出错）
+#   B   bugbear       —— 可疑写法：except 里 raise 丢链、zip 长度不等、可变默认值
+#   E9  pycodestyle   —— 语法级错误（E901 无效语法等），阻止代码根本跑不起来
+#
+# 故意不选 E/W 其余规则：这个仓库是紧凑风格手写代码，行宽/空行类检查
+# 会产出几百条与正确性无关的噪声，反而淹没真问题。
+
+target-version = "py312"
+line-length = 140
+
+extend-exclude = [
+    "tests/.tools",
+    "tests/.pip-tmp",
+    "tests/.tmp-*",
+    ".tmp-*",
+    "vendor",
+]
+
+[lint]
+select = ["F", "B", "E9"]

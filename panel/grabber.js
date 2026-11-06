@@ -9,7 +9,7 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { domainMatches, findPreset, siteFromUrl } from "./sites.js";
-import { visionHome } from "./store.js";
+import { restrict, visionHome } from "./store.js";
 import { wsConnect } from "./ws.js";
 
 const POLL_MS = 1200;
@@ -157,6 +157,8 @@ export class Grabber {
 		}
 		const profileDir = browserProfileDir();
 		await mkdir(profileDir, { recursive: true });
+		// 这个目录里有浏览器的 Cookie 库，权限收紧到只有当前用户 + SYSTEM 能读
+		restrict(profileDir);
 		// 无头只用于自动化测试：看不到界面就没法在里面登录，正式使用必须是有头。
 		const headless = /^(1|true|yes)$/i.test(String(process.env.YTDLP_VISION_HEADLESS ?? ""));
 		const args = [
@@ -201,7 +203,12 @@ export class Grabber {
 		try {
 			session.port = await waitForPort(profileDir, deadline);
 			const version = await fetchJson(`http://127.0.0.1:${session.port}/json/version`);
-			session.ws = await wsConnect(version.webSocketDebuggerUrl, { timeoutMs: 8000 });
+			const wsUrl = String(version.webSocketDebuggerUrl ?? "");
+			// DevToolsActivePort 文件在用户目录里，别的进程能改写它；只连本机回环地址
+			if (!/^ws:\/\/(?:127\.0\.0\.1|\[::1\]|localhost):\d+\//.test(wsUrl)) {
+				throw new Error("DevTools 返回了非本机调试地址，已拒绝连接（可能是端口被其它程序占用）");
+			}
+			session.ws = await wsConnect(wsUrl, { timeoutMs: 8000 });
 			const ws = session.ws;
 			ws.onMessage((text) => {
 				let message;

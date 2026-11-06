@@ -280,7 +280,7 @@
 
 	el("btn-grab-save").addEventListener("click", async () => {
 		try {
-			const payload = await api("grab/finish");
+			const payload = await api("grab/finish", {});
 			grab = payload.grab;
 			lastGrabStatus = "done";
 			toast(payload.result?.message ?? "已保存", "ok");
@@ -293,7 +293,7 @@
 
 	el("btn-grab-cancel").addEventListener("click", async () => {
 		try {
-			const payload = await api("grab/cancel");
+			const payload = await api("grab/cancel", {});
 			grab = payload.grab;
 			lastGrabStatus = "cancelled";
 			toast("已取消，没有保存");
@@ -431,10 +431,29 @@
 
 	el("btn-sync").addEventListener("click", async () => {
 		try {
-			const payload = await api("sync");
+			const payload = await api("sync", {});
 			el("sync-hint").textContent = `${payload.file.rows} 行 · ${new Date(payload.file.at).toLocaleTimeString()}`;
 			toast("已生成 cookies.txt", "ok");
 			await load();
+		} catch (error) {
+			toast(String(error.message ?? error), "err");
+		}
+	});
+
+	el("btn-export").addEventListener("click", async () => {
+		try {
+			const payload = await api("export", {});
+			// 明文只经过这一次 Blob 下载，不写 localStorage、不进 DOM 文本
+			const blob = new Blob([payload.text], { type: "text/plain;charset=utf-8" });
+			const href = URL.createObjectURL(blob);
+			const link = document.createElement("a");
+			link.href = href;
+			link.download = payload.name;
+			document.body.append(link);
+			link.click();
+			link.remove();
+			setTimeout(() => URL.revokeObjectURL(href), 5000);
+			toast(`已导出 ${payload.rows} 条（文件含凭据，用完请删除）`, "ok");
 		} catch (error) {
 			toast(String(error.message ?? error), "err");
 		}

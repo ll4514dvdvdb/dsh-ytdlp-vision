@@ -21,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 from pathlib import Path
@@ -53,6 +54,20 @@ CACHE = Path(_env("CACHE") or (Path.home() / ".dsh" / "ytdlp-vision-cache"))
 MODEL = _env("MODEL", "deepseek-flash")
 CACHE_VERSION = 3
 API_BASE = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+
+# 资源保护阈值。超长的视频不阻断，但会明确警告（用户可用 start/end 截一段）。
+MAX_DURATION_SECONDS = float(_env("MAX_DURATION_SECONDS") or 6 * 3600)
+MAX_PIXELS = 33_000_000          # ≈ 8K（7680×4320）
+MAX_ASR_SECONDS = float(_env("MAX_ASR_SECONDS") or 4 * 3600)
+# 缓存容量上限与过期时间（0 表示不限制）
+CACHE_MAX_BYTES = int(float(_env("CACHE_MAX_GB") or 5) * (1 << 30))
+CACHE_TTL_DAYS = float(_env("CACHE_TTL_DAYS") or 30)
+# 下载前要求的最小可用磁盘余量，避免写到一半才发现没空间
+MIN_FREE_BYTES = int(float(_env("MIN_FREE_GB") or 1) * (1 << 30))
+# 单个媒体文件上限（B 站 dash 流）
+MAX_MEDIA_BYTES = int(float(_env("MAX_MEDIA_GB") or 8) * (1 << 30))
+# ffmpeg 流式解码的看门狗上限：卡死时杀进程报错，别把插件永久挂住
+FFMPEG_STREAM_TIMEOUT = float(_env("FFMPEG_TIMEOUT") or 900)
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
@@ -287,10 +302,19 @@ def _api(path: str, params: dict, cookie: str = "") -> dict:
     h = {"User-Agent": UA, "Referer": "https://www.bilibili.com/"}
     if cookie:
         h["Cookie"] = cookie
-    r = _bili_request('get', f"https://api.bilibili.com{path}", params=params,
-                      headers=h, timeout=20)
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = _bili_request('get', f"https://api.bilibili.com{path}", params=params,
+                          headers=h, timeout=20)
+        r.raise_for_status()
+    except Exception as e:  # noqa: BLE001 - 转成能定位阶段的提示
+        status = getattr(getattr(e, 'response', None), 'status_code', None)
+        raise RuntimeError(
+            f'B 站接口 {path} 请求失败（{e.__class__.__name__}'
+            f'{f"，HTTP {status}" if status else ""}）：检查网络或代理后重试') from e
+    try:
+        return r.json()
+    except ValueError as e:
+        raise RuntimeError(f'B 站接口 {path} 返回的不是 JSON（可能被风控页拦截）') from e
 
 
 def _cookie() -> str:
@@ -301,10 +325,24 @@ def _cookie() -> str:
     return vcookies.bili_cookie()
 
 
+# B 站错误码 → 人话。用户能据此判断是自己、视频还是网络的问题。
+BILI_HINTS = {
+    -101: '登录态未生效或已失效，请到 Cookie 面板重新抓取',
+    -403: '没有访问权限（可能需要登录、大会员，或该视频已设为私有）',
+    -404: '视频不存在或已被删除',
+    -400: '请求参数不对（检查 BV 号/分 P 页码）',
+    -412: '请求被 B 站风控拦截，通常是全局代理导致，关掉代理后重试',
+    -352: '请求被 B 站风控拦截（校验失败），稍后再试或更换网络',
+    -509: '请求过于频繁，稍后再试',
+}
+
+
 def fetch_meta(bvid: str, page: int = 1) -> dict:
     j = _api('/x/web-interface/view', {'bvid': bvid}, _cookie())
     if j.get('code') != 0:
-        raise RuntimeError(f"取元数据失败: {j.get('code')} {j.get('message')}")
+        hint = BILI_HINTS.get(j.get('code'))
+        raise RuntimeError(f"取元数据失败: {j.get('code')} {j.get('message')}"
+                           + (f"；{hint}" if hint else ""))
     d = j['data']
     pages = d.get('pages') or [{'cid':d['cid'], 'duration':d['duration'], 'part':d['title']}]
     if page > len(pages):
@@ -321,7 +359,6 @@ def fetch_subtitle(bvid: str, cid: int, sessdata: str) -> list[dict] | None:
     """B 站 CC 字幕。匿名基本返回 0 条，需要 SESSDATA。"""
     if not sessdata:
         return None
-    import requests
     h = {"User-Agent": UA, "Referer": f"https://www.bilibili.com/video/{bvid}/",
          "Cookie": vcookies.bili_cookie() or f"SESSDATA={sessdata}"}
     try:
@@ -361,22 +398,49 @@ def download_audio(meta: dict, work: Path) -> Path | None:
         return dst
     try:
         return download_media(fetch_audio_url(meta['bvid'], meta['cid']), dst, meta['bvid'])
+    except DiskFullError:
+        raise
     except Exception as e:
         log(f'音轨不可用: {e}')
         return None
 
 
+class DiskFullError(RuntimeError):
+    """磁盘/缓存目录余量不足。单独成类，好让上层决定是警告还是中止。"""
+
+
+def ensure_space(path: Path, need: int = 0) -> None:
+    """下载/写缓存前确认盘上还有余量，不够时立刻说清楚，而不是写到一半失败。"""
+    try:
+        usage = shutil.disk_usage(str(path))
+    except OSError:
+        return
+    required = max(need, MIN_FREE_BYTES)
+    if usage.free < required:
+        raise DiskFullError(
+            f"磁盘空间不足：{path} 所在分区剩余 {usage.free / 1e9:.1f}GB，"
+            f"至少需要 {required / 1e9:.1f}GB。可清理旧缓存或换 YTDLP_VISION_CACHE 目录。")
+
+
 def download_media(url: str, dst: Path, bvid: str) -> Path:
+    ensure_space(dst.parent)
     tmp = dst.with_suffix(dst.suffix + '.part')
     try:
         with _bili_request('get', url, headers={'User-Agent':UA, 'Referer':f'https://www.bilibili.com/video/{bvid}/'},
                            timeout=(15, 120), stream=True) as r:
             r.raise_for_status()
+            declared = r.headers.get('Content-Length')
+            if declared and declared.isdigit() and int(declared) > MAX_MEDIA_BYTES:
+                raise RuntimeError(
+                    f'媒体文件 {int(declared) / 1e9:.1f}GB 超过上限 '
+                    f'{MAX_MEDIA_BYTES / 1e9:.1f}GB（YTDLP_VISION_MAX_MEDIA_GB）')
             size = 0
             with tmp.open('wb') as f:
                 for chunk in r.iter_content(1 << 16):
                     f.write(chunk)
                     size += len(chunk)
+                    if size > MAX_MEDIA_BYTES:
+                        raise RuntimeError(f'媒体下载超过 {MAX_MEDIA_BYTES / 1e9:.1f}GB 上限，已中止')
             expected = r.headers.get('Content-Length')
             if not size or (expected and not r.headers.get('Content-Encoding') and size != int(expected)):
                 raise RuntimeError('媒体下载不完整')
@@ -398,6 +462,8 @@ def download_video(meta: dict, work: Path, height: int = 720) -> Path | None:
             raise RuntimeError(f"没有视频流: {j.get('message', '')}")
         pick = min(vids, key=lambda v:(abs(v.get('height',0)-height), 0 if 'avc' in v.get('codecs','') else 1))
         return download_media(pick['baseUrl'], dst, meta['bvid'])
+    except DiskFullError:
+        raise
     except Exception as e:
         log(f'视频不可用，将明确标记视觉缺失: {e}')
         return None
@@ -416,13 +482,29 @@ def download_video(meta: dict, work: Path, height: int = 720) -> Path | None:
 
 def frame_scores(video: Path, gw: int = 64, gh: int = 36,
                  blocks: int = 4, sample_fps: float = 2.0) -> tuple[list[float], float]:
-    """Stream sampled grayscale frames: memory is independent of video duration."""
+    """Stream sampled grayscale frames: memory is independent of video duration.
+
+    读循环由看门狗线程兜底：ffmpeg 卡死（损坏文件、管道半关）时 read 会永久阻塞，
+    超过 FFMPEG_STREAM_TIMEOUT 秒就杀掉进程并报错，而不是把整个插件挂住。
+    """
     import numpy as np
     cmd = [ff(), '-v','error','-i',str(video),'-an','-vf',
            f'fps={sample_fps},scale={gw}:{gh},format=gray','-f','rawvideo','-']
     scores, previous = [], None
+    done = threading.Event()
+    timed_out = threading.Event()
     with tempfile.TemporaryFile() as err:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+
+        def _watchdog() -> None:
+            if not done.wait(FFMPEG_STREAM_TIMEOUT):
+                timed_out.set()
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+
+        threading.Thread(target=_watchdog, name='ffmpeg-watchdog', daemon=True).start()
         try:
             while True:
                 raw = proc.stdout.read(gw * gh)
@@ -439,10 +521,15 @@ def frame_scores(video: Path, gw: int = 64, gh: int = 36,
                     local = d[:bh*blocks,:bw*blocks].reshape(blocks,bh,blocks,bw).mean(axis=(1,3)).max()
                     scores.append(float(max(d.mean(),local)/255))
                 previous = frame
+            if timed_out.is_set():
+                raise RuntimeError(
+                    f'ffmpeg 解码超时（{FFMPEG_STREAM_TIMEOUT:.0f} 秒未完成）：视频可能损坏或分辨率异常；'
+                    f'可用 YTDLP_VISION_FFMPEG_TIMEOUT 调大上限，或用 --max-frames 降低采样量')
             if proc.wait() != 0:
                 err.seek(0)
                 raise RuntimeError(err.read()[-1200:].decode('utf-8','replace'))
         finally:
+            done.set()
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
@@ -544,22 +631,25 @@ def _decode_audio(path: Path, sr: int = 16000):
     """
     自己把音轨解成 16k 单声道 float32 再喂 whisper。
     绕开 faster-whisper 1.2.x 调 av.open(metadata_errors=...) 的兼容问题。
+
+    用 bytearray 累积原始 PCM（而不是 list + concatenate），1 小时音频的内存
+    峰值从约 460MB 降到约 230MB，且零拷贝转成 ndarray。
     """
     import av
     import numpy as np
 
-    chunks = []
+    buf = bytearray()
     with av.open(str(path)) as c:
         stream = c.streams.audio[0]
         res = av.AudioResampler(format="flt", layout="mono", rate=sr)
         for frame in c.decode(stream):
             for f in res.resample(frame):
-                chunks.append(f.to_ndarray().reshape(-1))
+                buf += np.asarray(f.to_ndarray(), dtype="float32").reshape(-1).tobytes()
         for f in res.resample(None):
-            chunks.append(f.to_ndarray().reshape(-1))
-    if not chunks:
+            buf += np.asarray(f.to_ndarray(), dtype="float32").reshape(-1).tobytes()
+    if not buf:
         return np.zeros(0, dtype="float32")
-    return np.concatenate(chunks).astype("float32")
+    return np.frombuffer(buf, dtype="float32")
 
 
 def transcribe(audio: Path, title: str = "") -> list[dict]:
@@ -592,21 +682,48 @@ def transcribe(audio: Path, title: str = "") -> list[dict]:
 
     try:
         pcm = _decode_audio(audio)
-        log(f"音轨解码完成：{len(pcm) / 16000:.1f}s")
+        secs = len(pcm) / 16000
+        log(f"音轨解码完成：{secs:.1f}s")
+        if secs > MAX_ASR_SECONDS:
+            # 超长音频不静默截断（会丢后半段证据），明确降级到字幕/画面
+            log(f"音轨 {secs / 3600:.1f} 小时，超过本地转写上限 "
+                f"{MAX_ASR_SECONDS / 3600:.1f} 小时（YTDLP_VISION_MAX_ASR_SECONDS），"
+                f"跳过 ASR；可用 --start/--end 分段转写")
+            return []
         source = pcm if len(pcm) else str(audio)
     except Exception as e:
         log(f"PyAV 解码失败，退回直接传路径: {e}")
         source = str(audio)
-    segs, _ = m.transcribe(
-        source,
-        language=os.environ.get("YTDLP_VISION_LANG") or None,
-        initial_prompt=title or None,   # 用标题当提示，专名/数字错得少
-        vad_filter=False,               # 音乐/歌声视频必须关，否则 0 段
-    )
-    out = [{"start": round(s.start, 2), "end": round(s.end, 2),
-            "text": s.text.strip()} for s in segs if s.text.strip()]
+    try:
+        segs, _ = m.transcribe(
+            source,
+            language=os.environ.get("YTDLP_VISION_LANG") or None,
+            initial_prompt=title or None,   # 用标题当提示，专名/数字错得少
+            vad_filter=False,               # 音乐/歌声视频必须关，否则 0 段
+        )
+        out = [{"start": round(s.start, 2), "end": round(s.end, 2),
+                "text": s.text.strip()} for s in segs if s.text.strip()]
+    except Exception as e:  # noqa: BLE001 - ASR 不可用时降级到字幕/画面
+        log(f"本地转写失败（{e.__class__.__name__}: {e}），改用字幕/画面证据")
+        return []
     log(f"转写完成：{len(out)} 段")
     return out
+
+
+def asr_signature(audio: Path | None) -> str:
+    """ASR 缓存键：模型配置 + 音频文件的大小/修改时间。
+
+    只按模型配置做键的话，同一个 work 目录下音轨被替换（重下、换清晰度）时会
+    命中旧转写，等于让新视频用旧分析结果。带上音频指纹即可避免。
+    """
+    stamp = ''
+    if audio:
+        try:
+            info = audio.stat()
+            stamp = f'{info.st_size}:{info.st_mtime_ns}'
+        except OSError:
+            stamp = ''
+    return digest([_env(k, '') for k in ('ASR_MODEL', 'LANG', 'ASR_DEVICE', 'ASR_COMPUTE')] + [stamp])
 
 
 # ---------------------------------------------------------------- OCR
@@ -726,7 +843,7 @@ def video_lock(path: Path, timeout: float = 90):
                 break
             except OSError:
                 if time.monotonic()>=deadline:
-                    raise RuntimeError('同一视频正在处理，请稍后重试')
+                    raise RuntimeError('同一视频正在处理，请稍后重试') from None
                 time.sleep(.2)
         try:
             yield
@@ -740,6 +857,211 @@ def video_lock(path: Path, timeout: float = 90):
 
 def digest(obj) -> str:
     return hashlib.sha256(json.dumps(obj,sort_keys=True,ensure_ascii=False).encode()).hexdigest()[:24]
+
+
+# ---------------------------------------------------------------- 缓存管理
+
+_SAFE_DIR = re.compile(r'[0-9A-Za-z._-]{1,120}')
+
+
+def _dir_size(path: Path) -> tuple[int, int, float]:
+    """返回 (总字节, 文件数, 最新 mtime)。不跟随符号链接。"""
+    total = count = 0
+    newest = 0.0
+    for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
+        dirnames[:] = [d for d in dirnames if not (Path(dirpath) / d).is_symlink()]
+        for name in filenames:
+            item = Path(dirpath) / name
+            try:
+                info = item.lstat()
+            except OSError:
+                continue
+            total += info.st_size
+            count += 1
+            newest = max(newest, info.st_mtime)
+    return total, count, newest
+
+
+def cache_stats() -> dict:
+    """缓存占用统计：总量、按版本、占空间最多的条目。"""
+    versions = []
+    grand_total = grand_files = 0
+    entries = []
+    if CACHE.is_dir():
+        for version in sorted(CACHE.iterdir()):
+            if not version.is_dir() or version.is_symlink():
+                continue
+            size, files, newest = _dir_size(version)
+            versions.append({'name': version.name, 'bytes': size, 'files': files,
+                             'newest': time.strftime('%Y-%m-%d %H:%M', time.localtime(newest)) if newest else None,
+                             'current': version.name == f'v{CACHE_VERSION}'})
+            grand_total += size
+            grand_files += files
+            for entry in version.iterdir():
+                if entry.is_dir() and not entry.is_symlink():
+                    esize, efiles, enewest = _dir_size(entry)
+                    entries.append({'version': version.name, 'name': entry.name,
+                                    'bytes': esize, 'files': efiles, 'mtime': enewest})
+    entries.sort(key=lambda item: item['bytes'], reverse=True)
+    return {
+        'root': str(CACHE),
+        'current_version': f'v{CACHE_VERSION}',
+        'bytes': grand_total,
+        'mb': round(grand_total / (1 << 20), 1),
+        'files': grand_files,
+        'versions': versions,
+        'largest': [{**item, 'mtime': time.strftime('%Y-%m-%d %H:%M', time.localtime(item['mtime'])) if item['mtime'] else None}
+                    for item in entries[:10]],
+        'limits': {'max_gb': CACHE_MAX_BYTES / (1 << 30), 'ttl_days': CACHE_TTL_DAYS},
+    }
+
+
+def _lock_handle(lock_path: Path):
+    """打开并尝试非阻塞独占锁；成功返回句柄，失败/异常返回 None。"""
+    try:
+        handle = lock_path.open('a+b')
+    except OSError:
+        return None
+    try:
+        handle.seek(0, 2)
+        if not handle.tell():
+            handle.write(b'0')
+            handle.flush()
+        handle.seek(0)
+        if os.name == 'nt':
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return handle
+    except OSError:
+        handle.close()
+        return None
+
+
+def _unlock_handle(handle) -> None:
+    try:
+        handle.seek(0)
+        if os.name == 'nt':
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    finally:
+        handle.close()
+
+
+def _acquire_entry_locks(entry: Path) -> tuple[bool, list]:
+    """锁定条目下所有分 P 的处理锁（与 video_lock 同一路径）。
+
+    全部拿到才返回 True 和句柄列表；任一被占用就释放已拿到的并返回 False。
+    删目录期间一直持锁，避免「检查完、删除时任务刚好启动」的竞态。
+    """
+    pages = []
+    if entry.is_dir():
+        for child in entry.iterdir():
+            if child.is_dir() and re.fullmatch(r'p\d+', child.name):
+                pages.append(child.name)
+    if not pages:
+        return True, []
+    handles = []
+    for page in pages:
+        handle = _lock_handle(CACHE / f'{entry.name}_{page}.lock')
+        if handle is None:
+            for item in handles:
+                _unlock_handle(item)
+            return False, []
+        handles.append(handle)
+    return True, handles
+
+
+def cache_clean(dry_run: bool = False, max_bytes: int | None = None,
+                ttl_days: float | None = None, keep_newest: int = 0) -> dict:
+    """按「过期 → 超量」的顺序清理缓存。
+
+    安全约束：
+    - 只动 CACHE 下名字匹配 [0-9A-Za-z._-] 的目录，不跟符号链接；
+    - 删之前先拿该条目的处理锁，拿不到（正在跑）就跳过；
+    - dry_run 只统计不删，方便先看清单；
+    - 当前版本 v{CACHE_VERSION} 之外的历史版本整目录清理（v1/v2 无迁移价值）。
+    """
+    max_bytes = CACHE_MAX_BYTES if max_bytes is None else max_bytes
+    ttl_days = CACHE_TTL_DAYS if ttl_days is None else ttl_days
+    now = time.time()
+    removed, skipped, failed = [], [], []
+
+    def do_delete(entry: Path, reason: str) -> None:
+        locked, handles = _acquire_entry_locks(entry)
+        try:
+            if not locked:
+                skipped.append({'entry': str(entry), 'reason': '正在使用（锁被占用）'})
+                return
+            if dry_run:
+                removed.append({'entry': str(entry), 'reason': f'{reason}（未删除，dry-run）'})
+                return
+            try:
+                shutil.rmtree(entry)
+                removed.append({'entry': str(entry), 'reason': reason})
+            except OSError as exc:
+                failed.append({'entry': str(entry), 'error': str(exc)})
+        finally:
+            for handle in handles:
+                _unlock_handle(handle)
+
+    if CACHE.is_dir():
+        # 1) 历史版本：不迁移，整目录清掉（只认 vN 形式的合法名字）
+        for version in sorted(CACHE.iterdir()):
+            if not version.is_dir() or version.is_symlink():
+                continue
+            if not re.fullmatch(r'v\d+', version.name):
+                continue
+            if version.name == f'v{CACHE_VERSION}':
+                continue
+            if dry_run:
+                removed.append({'entry': str(version), 'reason': '旧缓存版本（未删除，dry-run）'})
+            else:
+                try:
+                    shutil.rmtree(version)
+                    removed.append({'entry': str(version), 'reason': '旧缓存版本'})
+                except OSError as exc:
+                    failed.append({'entry': str(version), 'error': str(exc)})
+
+        # 2) 过期条目
+        current = CACHE / f'v{CACHE_VERSION}'
+        if current.is_dir():
+            for entry in sorted(current.iterdir()):
+                if not entry.is_dir() or entry.is_symlink() or not _SAFE_DIR.fullmatch(entry.name):
+                    continue
+                _, _, newest = _dir_size(entry)
+                if ttl_days > 0 and newest and now - newest > ttl_days * 86400:
+                    do_delete(entry, f'超过 {ttl_days:g} 天未使用')
+
+        # 3) 超量：按最近使用时间从旧到新删，保留 keep_newest 个
+        entries = []
+        if current.is_dir():
+            for entry in current.iterdir():
+                if entry.is_dir() and not entry.is_symlink() and _SAFE_DIR.fullmatch(entry.name):
+                    entries.append((entry, entry.stat().st_mtime if entry.exists() else 0))
+        entries.sort(key=lambda pair: pair[1])
+        live = [entry for entry, _ in entries if not any(str(entry) == item['entry'] for item in removed)]
+        total = sum(_dir_size(entry)[0] for entry in live)
+        keep = max(0, keep_newest)
+        while total > max_bytes and len(live) > keep:
+            entry = live.pop(0)
+            size = _dir_size(entry)[0]
+            do_delete(entry, f'超出 {max_bytes / (1 << 30):g}GB 上限')
+            total -= size
+
+    return {'root': str(CACHE), 'dry_run': dry_run, 'removed': removed,
+            'skipped': skipped, 'failed': failed,
+            'bytes_after': sum(_dir_size(entry)[0] for entry in
+                               (CACHE / f'v{CACHE_VERSION}').iterdir()
+                               if entry.is_dir() and not entry.is_symlink())
+            if (CACHE / f'v{CACHE_VERSION}').is_dir() else 0}
 
 
 def prepare(args, source: vidsrc.Source | None = None) -> Ctx:
@@ -775,6 +1097,17 @@ def prepare(args, source: vidsrc.Source | None = None) -> Ctx:
         raise ValueError('时间范围应满足 0 <= start < end <= 视频时长')
     where={'bilibili':'分P','local':'本地文件'}.get(source.kind) or (meta.get('platform') or '视频')
     log(f"《{meta['title']}》 {duration}s · {where} · 范围={ctx.start:.1f}-{ctx.end:.1f}s")
+    # 异常大的输入不阻断（用户可能就是要看长片），但要说清代价与解法
+    if duration > MAX_DURATION_SECONDS:
+        ctx.warnings.append(
+            f"视频时长 {duration / 3600:.1f} 小时，超过 {MAX_DURATION_SECONDS / 3600:.1f} 小时建议上限；"
+            f"抽帧仍按预算铺满全片，单帧间隔可能较大。需要细节请用 --start/--end 分段。")
+    width = int(meta.get('width') or 0)
+    height = int(meta.get('height') or 0)
+    if width and height and width * height > MAX_PIXELS:
+        ctx.warnings.append(
+            f"分辨率 {width}×{height} 超过 {MAX_PIXELS / 1e6:.0f}MP 建议上限；"
+            f"抽帧会先缩放到 frame_width，内存与耗时可能偏高。")
     text_only=args.cmd=='text' or args.vision_policy=='text' or args.subtitle_only
     need_visual=not (args.no_video or text_only)
     need_speech=not (args.no_asr or args.subtitle_only or args.cmd=='frames')
@@ -809,28 +1142,30 @@ def prepare(args, source: vidsrc.Source | None = None) -> Ctx:
                 if ctx.subtitle:
                     save_json(sub_path,{'auth':digest('ytdlp'),'saved':time.time(),'segments':ctx.subtitle})
     if need_speech and (not ctx.subtitle or args.force_asr):
-        signature=digest([_env(k,'') for k in ('ASR_MODEL','LANG','ASR_DEVICE','ASR_COMPUTE')])
+        audio=None
+        if source.kind=='bilibili':
+            audio=download_audio(meta,work)
+        elif source.kind=='local':
+            # 原文件直接给转写：PyAV 能从视频容器里解出音轨
+            audio=Path(meta['local_path'])
+        else:
+            audio=vidsrc.download_audio_ytdlp(source,work)
+        # 缓存键除模型配置外还带音频文件本身的大小/修改时间：
+        # 同一个 work 目录下音轨被替换（重下、换音轨）时不会复用旧转写。
+        signature=asr_signature(audio)
         asr_path=work/f'asr_{signature}.json'
         cached=load_json(asr_path)
         if cached is not None and not args.force_asr:
             ctx.asr=cached
             log(f'转写：命中缓存 {len(cached)} 段')
-        else:
-            if source.kind=='bilibili':
-                audio=download_audio(meta,work)
-            elif source.kind=='local':
-                # 原文件直接给转写：PyAV 能从视频容器里解出音轨
-                audio=Path(meta['local_path'])
-            else:
-                audio=vidsrc.download_audio_ytdlp(source,work)
-            if audio:
-                try:
-                    ctx.asr=transcribe(audio,meta['title'])
-                except Exception as e:
-                    ctx.warnings.append(f'语音转写失败：{e}')
-                    ctx.asr=[]
-                if ctx.asr:
-                    save_json(asr_path,ctx.asr)
+        elif audio:
+            try:
+                ctx.asr=transcribe(audio,meta['title'])
+            except Exception as e:
+                ctx.warnings.append(f'语音转写失败：{e}')
+                ctx.asr=[]
+            if ctx.asr:
+                save_json(asr_path,ctx.asr)
     if not ctx.subtitle and not ctx.asr and args.cmd!='frames':
         ctx.warnings.append('没有可用字幕/转写；不能据此推断口播内容。')
     if need_visual:
@@ -1052,13 +1387,13 @@ def build_evidence(ctx: Ctx, args) -> dict:
     for offset in range(0,len(frames),args.grid_size):
         group=frames[offset:offset+args.grid_size]
         paths=[ctx.work/'frames'/f['file'] for f in group]
-        fingerprint=digest([args.grid_size,[(f['t'],hashlib.sha256(p.read_bytes()).hexdigest()) for f,p in zip(group,paths)]])
+        fingerprint=digest([args.grid_size,[(f['t'],hashlib.sha256(p.read_bytes()).hexdigest()) for f,p in zip(group,paths,strict=True)]])
         dst=ctx.work/f'grid_{fingerprint}.jpg'
         if args.refresh or not dst.exists():
             gridify(paths,dst,cols=int(math.sqrt(args.grid_size)),labels=[f"{f['t']:.1f}s" for f in group])
         images.append({'path':str(dst.resolve()),'times':[f['t'] for f in group]})
     times=sampled_times
-    gaps=[b-a for a,b in zip([ctx.start]+times,times+[ctx.end])] if times else []
+    gaps=[b-a for a,b in zip([ctx.start]+times,times+[ctx.end],strict=True)] if times else []
     coverage={'range':[ctx.start,ctx.end],'selected_frame_times':times,
               'largest_unsampled_gap_seconds':round(max(gaps),2) if gaps else None,
               'source_resolution':ctx.meta.get('source_resolution'),'unique_images':len(frames),'text_lines':len(lines),'omitted_text_lines':omitted,'text_source':ctx.skeleton}
@@ -1155,7 +1490,7 @@ def cmd_run(ctx: Ctx, args, evidence: dict) -> None:
 
 def parser():
     ap=argparse.ArgumentParser(prog='bv',description='本地整理视频证据，供 DSH 直接看图；独立 run 可选')
-    ap.add_argument('cmd',choices=['inspect','plan','run','frames','text','clean'])
+    ap.add_argument('cmd',choices=['inspect','plan','run','frames','text','clean','cache-stats','cache-clean'])
     ap.add_argument('target',nargs='?',default='')
     ap.add_argument('--ask',default='这个视频讲了什么？按时间顺序说清主线。')
     ap.add_argument('--sessdata',default='')
@@ -1181,6 +1516,14 @@ def parser():
     ap.add_argument('--playlist',action='store_true')
     ap.add_argument('--index',type=int)
     ap.add_argument('--limit',type=int,default=10)
+    # cache-stats / cache-clean
+    ap.add_argument('--max-cache-gb',type=float,default=None,
+                    help='缓存容量上限（GB），默认取 YTDLP_VISION_CACHE_MAX_GB 或 5')
+    ap.add_argument('--ttl-days',type=float,default=None,
+                    help='多久没用就清理（天），默认取 YTDLP_VISION_CACHE_TTL_DAYS 或 30；0 表示不按时间清')
+    ap.add_argument('--keep-newest',type=int,default=0,
+                    help='超量清理时至少保留几个最近使用的条目')
+    ap.add_argument('--dry-run',action='store_true',help='只报告会删什么，不真删')
     return ap
 
 
@@ -1230,6 +1573,13 @@ def main():
         if value is not None and (not math.isfinite(value) or value<0):
             ap.error(f'{name} 必须为非负有限秒数')
     args.grid_size=args.grid_size or (1 if args.start is not None or args.end is not None else 4)
+    if args.cmd=='cache-stats':
+        print(json.dumps(cache_stats(),ensure_ascii=False,indent=2));return
+    if args.cmd=='cache-clean':
+        max_bytes=None if args.max_cache_gb is None else max(0,int(args.max_cache_gb*(1<<30)))
+        report=cache_clean(dry_run=args.dry_run,max_bytes=max_bytes,
+                           ttl_days=args.ttl_days,keep_newest=args.keep_newest)
+        print(json.dumps(report,ensure_ascii=False,indent=2));return
     if args.cmd=='clean':
         # Never remove a configured cache root itself, or follow symlinks.
         version=CACHE/f'v{CACHE_VERSION}'
@@ -1319,3 +1669,15 @@ if __name__=='__main__':
         main()
     except (ValueError,RuntimeError) as e:
         log(f'失败：{e}');sys.exit(1)
+    except OSError as e:
+        # 磁盘满 / 权限 / 文件被占用：说清是哪一类，而不是甩 traceback
+        errno=getattr(e,'errno',None)
+        if errno in (28,112) or 'space' in str(e).lower():
+            log(f'磁盘空间不足（{e}）：请清理缓存后重试，或用 scripts/vision.py cache-clean 清理旧缓存')
+        elif errno in (13,5):
+            log(f'没有权限读写文件（{e}）：检查缓存目录权限，或设 YTDLP_VISION_CACHE 指向可写目录')
+        else:
+            log(f'文件操作失败（{e.__class__.__name__}）：{e}')
+        sys.exit(1)
+    except KeyboardInterrupt:
+        log('已中断');sys.exit(130)

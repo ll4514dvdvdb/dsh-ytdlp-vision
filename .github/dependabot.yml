@@ -1,0 +1,39 @@
+# 依赖版本检查（任务书第四阶段要求）。
+#
+# GitHub 的 Dependabot 每周检查一次：
+#   - pip  : requirements.txt 里的 requests/numpy/Pillow/faster-whisper/av/rapidocr
+#   - npm  : package.json（本插件没有运行时依赖，主要盯 devDependencies 与 engines）
+#   - gha  : .github/workflows 里用到的 action 版本
+#
+# 注意：yt-dlp 不在这里——它由 plugins 自己的 update.py 在启动时从 GitHub
+# release 更新（带 SHA256 + GPG 校验），不经过 pip。
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(py)"
+    labels: ["dependencies", "python"]
+
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(node)"
+    labels: ["dependencies", "node"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "deps(ci)"
+    labels: ["dependencies", "ci"]

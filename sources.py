@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -54,7 +55,35 @@ def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
-def run(cmd: list[str], timeout: int = 1800, env: dict | None = None) -> str:
+# 单次 yt-dlp stdout 的上限：-J 会整份 JSON 进内存，异常站点可能给几百 MB。
+MAX_JSON_BYTES = 32 << 20
+# 字幕文件上限：正常字幕几百 KB，超过就是异常（或恶意）。
+MAX_SUBTITLE_BYTES = 8 << 20
+# yt-dlp 下载时的单文件上限，超长/超清视频在解析阶段就被拦下，不会写满磁盘。
+MAX_DOWNLOAD_FILESIZE = "4G"
+
+
+def _public_http_url(url: str) -> bool:
+    """只放行 http/https 的公网地址（挡 loopback、内网段、云元数据地址）。"""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return False
+    host = parsed.hostname.lower().strip("[]")
+    if host in ("localhost",) or host.endswith(".localhost") or host.endswith(".local"):
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return True  # 域名交给系统解析；DNS rebinding 不在本层处理
+    return not (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+def run(cmd: list[str], timeout: int = 1800, env: dict | None = None,
+        max_stdout: int | None = None) -> str:
     p = subprocess.run(
         cmd, capture_output=True, timeout=timeout,
         env={**os.environ, **(env or {})},
@@ -63,6 +92,9 @@ def run(cmd: list[str], timeout: int = 1800, env: dict | None = None) -> str:
     if p.returncode != 0:
         tail = (p.stderr or b"")[-1200:].decode("utf-8", "replace")
         raise RuntimeError(f"命令失败({p.returncode}): {' '.join(cmd[:2])}…\n{tail}")
+    if max_stdout is not None and len(p.stdout) > max_stdout:
+        raise RuntimeError(f"命令输出超过 {max_stdout >> 20}MB 上限，已放弃解析"
+                           f"（{' '.join(cmd[:2])}…）")
     return p.stdout.decode("utf-8", "replace") + p.stderr.decode("utf-8", "replace")
 
 
@@ -208,7 +240,7 @@ def list_playlist(url: str, python: str | None = None, timeout: int = 300,
     cmd = [*ytdlp_prefix(python), "-J", "--flat-playlist", "--no-warnings",
            "--no-progress", "--playlist-end", str(cap),
            *vcookies.ytdlp_auth_args(), url]
-    raw = run(cmd, timeout=timeout)
+    raw = run(cmd, timeout=timeout, max_stdout=MAX_JSON_BYTES)
     start = raw.find("{")
     if start < 0:
         raise RuntimeError(f"yt-dlp 没有返回播放列表 JSON：{raw[-400:]}")
@@ -299,7 +331,7 @@ def ytdlp_json(url: str, python: str | None = None, timeout: int = 180) -> dict:
     cmd = [*ytdlp_prefix(python), "-J", "--no-warnings", "--no-playlist",
            "--no-progress", *vcookies.ytdlp_auth_args(), url]
     with _tmp_stderr_wrap():
-        raw = run(cmd, timeout=timeout)
+        raw = run(cmd, timeout=timeout, max_stdout=MAX_JSON_BYTES)
     # -J 输出到 stdout，run() 把 stderr 拼在后面；从第一个 { 开始找平衡的 JSON
     start = raw.find("{")
     if start < 0:
@@ -498,9 +530,9 @@ def fetch_subtitle_ytdlp(info: dict, timeout: int = 90) -> list[dict] | None:
     url, ext, lang = picked
     import requests
     try:
-        resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
-        resp.raise_for_status()
-        body = resp.text
+        resp = _get_limited(requests, url, timeout=timeout, limit=MAX_SUBTITLE_BYTES,
+                            headers={"User-Agent": "Mozilla/5.0"})
+        body = resp
         if ext in ("json3", "srv3"):
             rows = _parse_json3(json.loads(body))
         elif ext in ("vtt",):
@@ -514,6 +546,50 @@ def fetch_subtitle_ytdlp(info: dict, timeout: int = 90) -> list[dict] | None:
         return None
     log(f"字幕：{lang}（{ext}），共 {len(rows)} 段")
     return rows or None
+
+
+def _get_limited(requests, url: str, *, timeout: int, limit: int,
+                 headers: dict | None = None, hops: int = 4) -> str:
+    """下载文本资源：逐跳校验重定向目标、流式读取并限制总大小。
+
+    字幕 URL 由站点页面的元数据给出，可能指向任何地方（含内网），
+    所以这里既不许 loopback/内网，也不许超预期大小。
+    """
+    current = url
+    for _ in range(hops):
+        if not _public_http_url(current):
+            raise RuntimeError(f"拒绝下载非公网 http(s) 地址：{current[:200]}")
+        resp = requests.get(current, timeout=timeout, stream=True,
+                            allow_redirects=False, headers=headers or {})
+        status = getattr(resp, "status_code", 200)
+        if status in (301, 302, 303, 307, 308):
+            target = resp.headers.get("location") or ""
+            resp.close()
+            if not target:
+                raise RuntimeError("重定向缺少 Location")
+            from urllib.parse import urljoin
+            current = urljoin(current, target)
+            continue
+        if status >= 400:
+            resp.close()
+            raise RuntimeError(f"HTTP {status}")
+        declared = resp.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > limit:
+            resp.close()
+            raise RuntimeError(f"字幕体积超过 {limit >> 20}MB 上限")
+        chunks, total = [], 0
+        for chunk in resp.iter_content(1 << 16):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > limit:
+                resp.close()
+                raise RuntimeError(f"字幕体积超过 {limit >> 20}MB 上限")
+            chunks.append(chunk)
+        if declared and declared.isdigit() and total < int(declared):
+            raise RuntimeError(f"字幕下载不完整：{total}/{declared} 字节")
+        return b"".join(chunks).decode("utf-8", "replace")
+    raise RuntimeError("重定向次数过多")
 
 
 # ---------------------------------------------------------------- 下载
@@ -536,7 +612,8 @@ def download_audio_ytdlp(src: Source, work: Path, python: str | None = None,
     log(f"yt-dlp 下载音频：{url}")
     try:
         run([*ytdlp_prefix(python), "-f", "bestaudio/best", "--no-warnings",
-             "--no-playlist", "--no-progress", "--no-part",
+             "--max-filesize", MAX_DOWNLOAD_FILESIZE,
+             "--no-playlist", "--no-progress",
              *vcookies.ytdlp_auth_args(),
              "-o", str(dl / "audio.%(ext)s"), url], timeout=timeout)
     except Exception as exc:  # noqa: BLE001
@@ -557,7 +634,8 @@ def download_video_ytdlp(src: Source, work: Path, height: int = 720,
     log(f"yt-dlp 下载视频（≤{height}p）：{url}")
     try:
         run([*ytdlp_prefix(python), "-f", fmt, "--no-warnings", "--no-playlist",
-             "--no-progress", "--no-part", *vcookies.ytdlp_auth_args(),
+             "--max-filesize", MAX_DOWNLOAD_FILESIZE,
+             "--no-progress", *vcookies.ytdlp_auth_args(),
              "-o", str(dl / "video.%(ext)s"), url],
             timeout=timeout)
     except Exception as exc:  # noqa: BLE001

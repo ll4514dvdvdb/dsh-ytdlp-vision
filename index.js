@@ -57,13 +57,50 @@ export function findPython(configured = '') {
   throw new Error('ytdlp-vision 需要 Python 3.10+；请设置 YTDLP_VISION_PYTHON 指向可用解释器')
 }
 
+// 并发上限：多个视频同时抽帧/转写会把机器打满，且 ffmpeg + whisper 都很吃内存。
+// 默认同时跑 2 个；可用 YTDLP_VISION_MAX_PARALLEL 调整（1 表示完全串行）。
+const MAX_PARALLEL = Math.max(1, Math.min(16, Number(process.env.YTDLP_VISION_MAX_PARALLEL) || 2))
+let activeJobs = 0
+const waitingJobs = []
+
+function acquireSlot(signal) {
+  if (activeJobs < MAX_PARALLEL) { activeJobs += 1; return Promise.resolve() }
+  return new Promise((resolve, reject) => {
+    const grant = () => { signal?.removeEventListener('abort', onAbort); resolve() }
+    const onAbort = () => {
+      const index = waitingJobs.indexOf(grant)
+      if (index >= 0) waitingJobs.splice(index, 1)
+      reject(signal.reason ?? new Error('已取消'))
+    }
+    waitingJobs.push(grant)
+    signal?.addEventListener('abort', onAbort, { once: true })
+    if (signal?.aborted) onAbort()
+  })
+}
+
+function releaseSlot() {
+  const next = waitingJobs.shift()
+  if (next) next()            // 名额直接转交，activeJobs 不变
+  else activeJobs = Math.max(0, activeJobs - 1)
+}
+
 export function runPy(python, args, { timeoutMs = 30 * 60 * 1000, signal, env = {}, onLog } = {}) {
+  // 同步检查，保持「已取消就不再启动子进程」的契约（调用方可直接 assert.throws）
   signal?.throwIfAborted()
-  return new Promise((resolvePromise, reject) => {
-    const child = spawn(python, [VISION_PY, ...args], {
-      cwd: HERE, windowsHide: true, detached: process.platform !== 'win32',
-      env: { ...process.env, ...env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
-    })
+  return acquireSlot(signal).then(() => new Promise((resolvePromise, reject) => {
+    let released = false
+    const release = () => { if (!released) { released = true; releaseSlot() } }
+    let child
+    try {
+      child = spawn(python, [VISION_PY, ...args], {
+        cwd: HERE, windowsHide: true, detached: process.platform !== 'win32',
+        env: { ...process.env, ...env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
+      })
+    } catch (error) {
+      release()
+      reject(error)
+      return
+    }
     const stdout = new StringDecoder('utf8'), stderr = new StringDecoder('utf8')
     let out = '', err = '', pending = '', failure, stopped = false
     const stop = reason => {
@@ -92,14 +129,14 @@ export function runPy(python, args, { timeoutMs = 30 * 60 * 1000, signal, env = 
       const lines = pending.split(/\r?\n/); pending = lines.pop()
       for (const line of lines) { if (line.trim()) onLog?.(line) }
     })
-    child.on('error', e => { cleanup(); reject(e) })
+    child.on('error', e => { cleanup(); release(); reject(e) })
     child.on('close', code => {
-      cleanup(); out += stdout.end(); err += stderr.end()
+      cleanup(); release(); out += stdout.end(); err += stderr.end()
       if (failure) reject(failure)
       else if (code !== 0) reject(new Error(`视频处理失败 exit=${code}\n${err.slice(-2500)}`))
       else resolvePromise({ out, err })
     })
-  })
+  }))
 }
 
 /** 每次启动在后台把 yt-dlp 更新到最新；失败静默，绝不阻塞 DSH 启动。 */

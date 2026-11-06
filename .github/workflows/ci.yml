@@ -1,0 +1,169 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-tests:
+    name: Python 测试 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.12']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: 语法检查
+        run: python -B -m compileall -q vision.py sources.py cookies.py update.py scripts tests
+
+      - name: 安装测试依赖（最小集，不装模型/OCR 运行时）
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install Pillow
+
+      - name: 单元测试（全部离线，不碰真实 Cookie 和网络）
+        run: python -B -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: 发布一致性检查
+        if: matrix.os == 'ubuntu-latest'
+        run: python -B scripts/check-release.py
+
+  node-tests:
+    name: Node 测试 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: ['20']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: 语法检查
+        run: |
+          node --check index.js
+          node --check client.js
+          node --check panel/grabber.js
+          node --check panel/routes.js
+          node --check panel/sites.js
+          node --check panel/store.js
+          node --check panel/ws.js
+          node --check web/app.js
+
+      - name: 单元测试
+        run: node --test tests/plugin.test.mjs tests/host.test.mjs tests/sites.test.mjs tests/store.test.mjs
+
+  lint:
+    name: 代码质量检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 只查「真会出错」的规则：pyflakes + bugbear + 语法级错误，
+      # 配置在 .ruff.toml 里（不引入风格检查，避免噪声淹没真问题）。
+      - name: ruff（Python 静态检查）
+        run: |
+          python -m pip install --upgrade pip ruff
+          ruff check .
+          ruff --version
+
+      # eslint 规则写在 eslint.config.mjs 里（手写规则，不依赖 @eslint/js，
+      # 这样装在 node_modules 还是 npx 临时目录行为一致）。
+      - name: eslint（Node 静态检查）
+        run: |
+          npm install --no-save --no-audit --no-fund eslint@10
+          npx eslint .
+          npx eslint --version
+
+  dependency-audit:
+    name: 依赖安全检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: pip-audit（只看直接依赖，避免装整套运行时）
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip-audit -r requirements.txt --no-deps --strict
+
+  package-check:
+    name: Release 构建检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 版本与资产一致性
+        run: python -B scripts/check-release.py
+
+      - name: npm pack 内容核对
+        run: |
+          npm pack --json > pack.json
+          node -e '
+            const pack = require("./pack.json")[0];
+            const files = new Set(pack.files.map(f => f.path));
+            const critical = [
+              "index.js", "vision.py", "update.py", "cordis.patch.yml",
+              "vendor/yt-dlp-py.zip", "vendor/VERSION.json", "vendor/yt-dlp-public.key",
+              "panel/store.js", "web/app.js",
+            ];
+            const missing = critical.filter(p => !files.has(p));
+            if (missing.length) {
+              console.error("打包缺少文件：" + missing.join(", "));
+              process.exit(1);
+            }
+            const mb = pack.size / 1048576;
+            console.log(`打包 OK：${files.size} 个文件，${mb.toFixed(1)}MB`);
+            if (mb > 12) {
+              console.error("包体积超过 12MB，检查是否误打包了缓存或模型");
+              process.exit(1);
+            }
+          '
+
+      - name: 上传构建产物（供 release 参考）
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarball
+          path: '*.tgz'
+          if-no-files-found: error
+          retention-days: 7

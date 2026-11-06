@@ -47,7 +47,7 @@ target ──┬─ B 站（BV 号 / bilibili.com / b23.tv）
 
 ```powershell
 # 1. 取包（或用 git clone https://github.com/ll4514dvdvdb/dsh-ytdlp-vision）
-curl -L -o ytdlp-vision.zip https://github.com/ll4514dvdvdb/dsh-ytdlp-vision/releases/download/v0.4.0/ytdlp-vision-0.4.0.zip
+curl -L -o ytdlp-vision.zip https://github.com/ll4514dvdvdb/dsh-ytdlp-vision/releases/download/v0.7.0/ytdlp-vision-0.7.0.zip
 Expand-Archive ytdlp-vision.zip -DestinationPath "$env:USERPROFILE\.dsh\ytdlp-vision-src" -Force
 
 # 2. 装 Python 依赖（用 DSH 自带解释器或任意 3.10+）
@@ -241,6 +241,14 @@ python scripts/fetch-ytdlp.py     # 直接把最新版拉进 vendor/
 | `YTDLP_VISION_ASR_MODEL` | `small` | faster-whisper 模型（`base` 约 14× 实时，`small` 约 3×） |
 | `YTDLP_VISION_ASR_DEVICE` | `cpu` | 有 N 卡可设 `cuda` |
 | `YTDLP_VISION_ASR_COMPUTE` | `int8` | 计算精度 |
+| `YTDLP_VISION_MAX_PARALLEL` | `2` | 同时分析的任务数上限（1–16） |
+| `YTDLP_VISION_MAX_ASR_SECONDS` | `14400` | 超过这个时长的音轨跳过 ASR，改用字幕/画面 |
+| `YTDLP_VISION_MAX_DURATION_SECONDS` | `21600` | 超过只提示「建议分段」，不阻断 |
+| `YTDLP_VISION_MAX_MEDIA_GB` | `8` | 单个媒体文件下载上限 |
+| `YTDLP_VISION_MIN_FREE_GB` | `1` | 磁盘余量低于这个值就拒绝下载 |
+| `YTDLP_VISION_CACHE_MAX_GB` | `5` | `cache-clean` 的容量上限 |
+| `YTDLP_VISION_CACHE_TTL_DAYS` | `30` | `cache-clean` 的过期天数 |
+| `YTDLP_VISION_FFMPEG_TIMEOUT` | `900` | 单个视频流式解码（`frame_scores`）的看门狗秒数；超时杀 ffmpeg 并报错，避免永久挂住 |
 | `BILI_VISION_SESSDATA` | 空 | B 站登录态，1080P 与 CC 字幕需要 |
 | `BILI_VISION_FFMPEG` / `..._FFPROBE` | PATH | 显式指定 ffmpeg 路径 |
 
@@ -253,19 +261,31 @@ python scripts/fetch-ytdlp.py     # 直接把最新版拉进 vendor/
 路径 `<cache>/v3/<平台_id>/p<页>/<分P或源标识>/`：
 
 - `meta.json` — 元信息（B 站 24 小时有效；yt-dlp 源每次重取）
-- `subtitle.json` / `asr_<sig>.json` — 字幕或转写
+- `subtitle.json` / `asr_<sig>.json` — 字幕或转写（`<sig>` 含音频文件大小与 mtime，换音轨不会串）
 - `video_<height>.mp4` — 抽帧用视频
 - `frames_<digest>.json`、`grid_*.jpg` — 选帧与合成图
 - `units.json` — 最终证据单元
 
-清理：`python vision.py clean <平台_id>`。换 `CACHE_VERSION` 会让旧缓存整体失效。
+查看与清理：
+
+```powershell
+python vision.py cache-stats                          # 总量、各版本、占用最大的条目
+python vision.py cache-clean --dry-run                # 只报告，不删
+python vision.py cache-clean --max-cache-gb 3 --ttl-days 14
+python vision.py cache-clean --keep-newest 2          # 最常用/最新的 2 条不参与容量清理
+python vision.py clean <平台_id>                      # 清掉某个视频的全部缓存
+```
+
+清理前会抢 `video_lock` 的同一把锁，正在分析中的条目会跳过并报「正在使用」，不会误删。`cache-clean` 也会顺手删掉旧 `CACHE_VERSION` 目录（v1/v2 → v3 迁移）。
 
 ---
 
 ## 已知限制
 
 - 登录墙内容（B 站充电视频、YouTube 会员）需要 cookie：用「视频 Cookie」页面填，或设 `BILI_VISION_SESSDATA`。
+- **Vimeo 现在要求登录才能解析**（yt-dlp 报 `The web client only works when logged-in`）。这是站点策略，不是插件问题；在 Cookie 面板给 vimeo.com 配 cookie 后可解。
 - yt-dlp 从 B 站抓会 412，所以 B 站永远走官方 API；这意味着 B 站之外的国内站点（如部分短视频平台）能否用取决于 yt-dlp 当日支持情况。
+- 平台可用性会变：站点改版、加验证、封 IP 都可能让某个站临时不可用。插件只做「拿到什么就如实报什么」，不会假装成功。
 - `run` 模式要额外配独立视觉 API，不配就只用当前模型。
 - ASR 在 CPU 上慢（`small` 约 3× 实时），长视频建议先看有没有字幕。
 
@@ -276,8 +296,21 @@ python scripts/fetch-ytdlp.py     # 直接把最新版拉进 vendor/
 ```powershell
 node smoke.mjs              # 离线冒烟：schema、参数校验、错误传播
 node tests/plugin.test.mjs  # 单文件跑单测（沙箱下 node --test 会 spawn EPERM）
+node tests/store.test.mjs   # cookie 存储层
 python -m unittest discover -s tests -p "test_*.py" -v
+python -B scripts/check-release.py   # 版本/CHANGELOG/vendor 资产一致性
 ```
+
+静态检查（只查真会出错的问题，不查风格；规则见 `.ruff.toml` 与 `eslint.config.mjs`）：
+
+```powershell
+ruff check .        # Python：pyflakes + bugbear + 语法级错误
+eslint .            # Node：未定义/未使用变量、可疑写法
+```
+
+两个工具都没随仓库分发，按需装（`pipx install ruff`、`npm i -g eslint`），或用 `npx --yes eslint@10 .`。
+
+CI（`.github/workflows/ci.yml`）在 Windows + Linux 双平台跑上面这些，外加 `lint` job、`pip-audit` 依赖审计和 `npm pack` 内容核对；`.github/dependabot.yml` 每周检查依赖版本。全部测试离线，不需要真实 Cookie 或网络。
 
 ---
 

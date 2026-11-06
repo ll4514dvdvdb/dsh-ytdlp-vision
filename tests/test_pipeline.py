@@ -1,13 +1,12 @@
 import contextlib
-import importlib.util
 import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
-import tempfile
-import time
+import uuid
 import unittest
 from unittest.mock import patch
 from PIL import Image
@@ -16,13 +15,20 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
 import vision as bv
 
+def mktmp(prefix):
+    # 不用 tempfile.TemporaryDirectory：收尾时它会 chmod，受限沙箱里会 [WinError 5]。
+    base=ROOT/'tests'/'.tmp-pipeline'
+    base.mkdir(parents=True,exist_ok=True)
+    path=base/f'{prefix}-{os.getpid()}-{uuid.uuid4().hex[:8]}'
+    path.mkdir(parents=True,exist_ok=True)
+    return path
+
 class VideoTests(unittest.TestCase):
     def setUp(self):
-        self.tmp=tempfile.TemporaryDirectory()
-        self.work=Path(self.tmp.name)
+        self.work=mktmp('video')
         (self.work/'frames').mkdir()
     def tearDown(self):
-        self.tmp.cleanup()
+        shutil.rmtree(self.work,ignore_errors=True)
     def ctx(self,n=20):
         frames=[]
         for i in range(n):
@@ -51,7 +57,7 @@ class VideoTests(unittest.TestCase):
     def test_long_static_scene_has_time_coverage(self):
         picked=bv.pick_frames([0]*600,2,[],300)
         self.assertGreater(len(picked),10)
-        self.assertLessEqual(max(b['t']-a['t'] for a,b in zip(picked,picked[1:])),15.01)
+        self.assertLessEqual(max(b['t']-a['t'] for a,b in zip(picked,picked[1:],strict=False)),15.01)
     def test_budget_never_drops_head_tail(self):
         picked=bv.pick_frames([i/600 for i in range(600)],2,list(range(1,300)),300,max_frames=12)
         self.assertEqual(len(picked),12)
@@ -182,15 +188,16 @@ class VideoTests(unittest.TestCase):
 class FFmpegTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.temp=tempfile.TemporaryDirectory();cls.root=Path(cls.temp.name)
+        cls.root=mktmp('ffmpeg')
         cls.video=cls.root/'test.mp4'
         try:
             subprocess.run([bv.ff(),'-v','error','-f','lavfi','-i','testsrc2=size=320x180:rate=10',
                 '-t','6','-c:v','libx264','-pix_fmt','yuv420p','-color_range','tv','-y',str(cls.video)],check=True,timeout=30)
         except (SystemExit,FileNotFoundError):
-            cls.temp.cleanup();raise unittest.SkipTest('ffmpeg unavailable')
+            shutil.rmtree(cls.root,ignore_errors=True)
+            raise unittest.SkipTest('ffmpeg unavailable') from None
     @classmethod
-    def tearDownClass(cls):cls.temp.cleanup()
+    def tearDownClass(cls):shutil.rmtree(cls.root,ignore_errors=True)
     def test_api_duration_longer_than_stream_does_not_fail_tail_extraction(self):
         args=bv.parser().parse_args(['inspect','BV1234567890','--no-asr','--no-ocr','--max-frames','12'])
         meta={'title':'rounding fixture','duration':7,'cid':11,'bvid':'BV1234567890'}
@@ -204,6 +211,17 @@ class FFmpegTests(unittest.TestCase):
         scores,fps=bv.frame_scores(self.video)
         self.assertEqual(fps,2);self.assertEqual(len(scores),12)
         self.assertGreater(max(scores),0)
+    def test_stuck_decoder_is_killed_instead_of_hanging_forever(self):
+        """ffmpeg 卡住时必须杀掉并报错，而不是让 read 永久阻塞（看门狗兜底）。"""
+        old=bv.FFMPEG_STREAM_TIMEOUT
+        bv.FFMPEG_STREAM_TIMEOUT=0.001
+        try:
+            with self.assertRaises(RuntimeError) as cm:
+                bv.frame_scores(self.video)
+        finally:
+            bv.FFMPEG_STREAM_TIMEOUT=old
+        self.assertIn('超时',str(cm.exception))
+        self.assertIn('YTDLP_VISION_FFMPEG_TIMEOUT',str(cm.exception))
     def test_refresh_overwrites_stale_pixels_and_time_names_differ(self):
         out=self.root/'frames'
         first=bv.extract_frames(self.video,[{'t':1,'score':0,'reason':'test'}],out)

@@ -66,10 +66,9 @@ def get_json(url: str, proxies, timeout=30) -> dict:
     return r.json()
 
 
-def download_with_resume(url: str, dest: Path, proxies, retries=8) -> str:
-    """分块续传下载，返回 sha256。已有 .part 时从断点继续。"""
-    part = dest.with_suffix(dest.suffix + ".part")
-    dest.parent.mkdir(parents=True, exist_ok=True)
+def download_to_part(url: str, part: Path, proxies, retries=8) -> str:
+    """分块续传下载到 part（不落地到最终文件），返回 sha256。已有 .part 时从断点继续。"""
+    part.parent.mkdir(parents=True, exist_ok=True)
     attempt = 0
     while True:
         attempt += 1
@@ -95,18 +94,29 @@ def download_with_resume(url: str, dest: Path, proxies, retries=8) -> str:
             break
         except Exception as e:  # noqa: BLE001 - 续传要吃掉所有网络异常
             if attempt >= retries:
+                part.unlink(missing_ok=True)
                 raise SystemExit(f"下载失败（试了 {attempt} 次）: {e}") from e
             wait = min(2 ** attempt, 20)
             print(f"  第 {attempt} 次中断（{e.__class__.__name__}），"
                   f"已下 {have/1048576:.1f}MB，{wait}s 后续传…", file=sys.stderr)
             time.sleep(wait)
-    # 校验后再原子替换
     h = hashlib.sha256()
     with open(part, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
-    os.replace(part, dest)
     return h.hexdigest()
+
+
+def fetch_sums(tag: str, proxies) -> str:
+    """取该 tag 的 SHA2-256SUMS 正文；拿不到就终止（不允许无校验下载）。"""
+    sums_url = f"https://github.com/yt-dlp/yt-dlp/releases/download/{tag}/SHA2-256SUMS"
+    try:
+        r = requests.get(sums_url, timeout=30, proxies=proxies)
+        r.raise_for_status()
+        return r.text
+    except Exception as e:  # noqa: BLE001
+        raise SystemExit(f"取不到 {tag} 的 SHA2-256SUMS（{e.__class__.__name__}: {e}），"
+                         f"没有校验信息就不下载") from e
 
 
 def main() -> int:
@@ -121,27 +131,35 @@ def main() -> int:
     out = Path(args.out)
 
     if args.tag:
-        tag, sums = args.tag, ""
+        tag = args.tag
+        print(f"使用指定 tag {tag}", file=sys.stderr)
     else:
         print("查询 GitHub 最新 release…", file=sys.stderr)
         rel = get_json(API, proxies)
         tag = rel["tag_name"]
-        sums_url = f"https://github.com/yt-dlp/yt-dlp/releases/download/{tag}/SHA2-256SUMS"
-        sums = requests.get(sums_url, timeout=30, proxies=proxies).text
+
+    sums = fetch_sums(tag, proxies)
 
     name, local = asset_for_current_platform(args.kind)
+    dest = out / local
+    part = out / (local + ".part")
     print(f"yt-dlp {tag} -> vendor/{local}", file=sys.stderr)
-    sha = download_with_resume(DL.format(tag=tag, name=name), out / local, proxies)
+    sha = download_to_part(DL.format(tag=tag, name=name), part, proxies)
     print(f"sha256 {sha}", file=sys.stderr)
 
     expected = None
     for line in sums.splitlines():
         parts = line.split()
         if len(parts) == 2 and parts[1].lstrip("*") == name:
-            expected = parts[0]
-    if expected and expected != sha:
-        (out / local).unlink(missing_ok=True)
-        raise SystemExit(f"校验失败，期望 {expected} 实际 {sha}")
+            expected = parts[0].strip().lower()
+    if not expected:
+        part.unlink(missing_ok=True)
+        raise SystemExit(f"SHA2-256SUMS 里没有 {name} 条目，放弃写入 vendor/")
+    if expected != sha:
+        part.unlink(missing_ok=True)
+        raise SystemExit(f"校验失败，期望 {expected} 实际 {sha}（vendor/ 未被改动）")
+
+    os.replace(part, dest)
 
     (out / "VERSION.json").write_text(
         json.dumps({"tag": tag, "asset": name, "file": local, "sha256": sha,

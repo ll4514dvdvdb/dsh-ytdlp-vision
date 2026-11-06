@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.7.0 — 2026-11-06
+
+安全与可靠性加固。功能没删，配置格式没变（`cookies.json` 仍是 v2，旧文件直接可用）。
+
+**自动更新（`update.py`、`scripts/fetch-ytdlp.py`）**
+- 拿不到 `SHA2-256SUMS` 就**放弃更新**，不再「没有校验信息也照装」。
+- 下载只写 `<目标>.part`，校验通过才原子替换；哈希不符、文件为空、下载截断都保留旧版本。
+- 逐跳校验重定向目标，只允许 `https://github.com`、`https://objects.githubusercontent.com`、`https://api.github.com`；非 https、带凭据、跳转到别的域名一律拒绝。
+- API/SHA2-256SUMS/资产都有响应体大小上限；tag 必须匹配 `YYYY.MM.DD[.N]` 才会拼进下载地址。
+- 可选 GPG 验签：包内钉死 yt-dlp 官方公钥（`vendor/yt-dlp-public.key`，sha256 写死在 `update.py`），机器上有 `gpg` 时验 `SHA2-256SUMS.sig`，验签失败拒绝替换；没有 `gpg` 就跳过并记日志。
+- 本地当前版本与 `state.json` 记录的哈希不符（被人换过）时强制重下。
+
+**Cookie（`cookies.py`、`panel/store.js`、`panel/routes.js`、`web/`）**
+- 文件权限：POSIX `0600`/目录 `0700`；Windows 用 `icacls` 断继承，只给当前用户和 SYSTEM。
+- `cookies.json` 损坏时备份成 `cookies.json.corrupt-<时间戳>` 再从空配置开始，不再静默丢数据。
+- 导入/导出都过滤控制字符，Netscape 第 4 列按 cookie 自己的 `secure` 输出（原来恒为 `TRUE`，纯 http 站点会收不到）。
+- 新增「导出 Netscape 文件」按钮（`POST export`），提示明文凭据、用完及时删除。
+- 拒绝 `__proto__`/`constructor`/`prototype` 作站点 id（原型污染），浏览器名走白名单；非法值降级成 `--cookies cookies.txt`。
+- 外部进程（Python 侧或另一个 DSH 实例）改过 `cookies.json` 时按 mtime 重新加载，不再用内存旧值覆盖。
+
+**命令执行与网络（`sources.py`、`vision.py`、`index.js`、`panel/grabber.js`）**
+- 字幕地址限制为公网 http(s)，逐跳校验重定向，体积上限 8MB，超限即中止（原来可以指向内网地址）。
+- `yt-dlp -J` 输出上限 32MB；下载加 `--max-filesize 4G`；去掉 `--no-part`，避免中断留下残缺文件被当成有效媒体。
+- 本地视频/媒体下载有大小上限（默认 8GB，`YTDLP_VISION_MAX_MEDIA_GB`）和磁盘余量检查（默认留 1GB）。
+- 浏览器 profile 目录权限收紧；DevTools WebSocket 只连 `127.0.0.1`/`::1`/`localhost`。
+- 并发分析任务受 `YTDLP_VISION_MAX_PARALLEL` 限制（默认 2）。
+
+**资源与缓存**
+- ASR 缓存键加入音频文件指纹（大小 + mtime），换音轨不会再命中旧转写。
+- ASR 解码不再把整段音频拼成一个大数组；超过 4 小时（`YTDLP_VISION_MAX_ASR_SECONDS`）跳过转写并说明原因，而不是静默截断。
+- 新增 `cache-stats` / `cache-clean` 命令：按容量上限（默认 5GB）、TTL（默认 30 天）、旧 `CACHE_VERSION` 清理；删除前抢同一把 `video_lock` 锁，正在使用的条目跳过。
+- 视频时长/分辨率超建议值时给警告（不阻断），`main()` 兜住 `OSError`，磁盘满、无权限都有中文提示。
+- `frame_scores()` 的流式解码加看门狗（`YTDLP_VISION_FFMPEG_TIMEOUT`，默认 900 秒）：ffmpeg 卡死时杀进程并报错，不再让整个分析永久阻塞。
+- 删光/删掉站点后不再残留旧 `cookies.txt`（原来只清了内存配置，文件里还留着已删除站点的凭据）。
+
+**可诊断性**
+- B 站错误码映射成人话（`-101` 登录失效→重抓 Cookie、`-404` 视频已删除、`-412` 代理导致风控…）。
+- 接口请求失败会写明是哪一步（取元数据、下载、字幕、转写）。
+
+**发布与测试**
+- 新增 `.github/workflows/ci.yml`：Windows + Linux 双平台跑 Python/Node 测试、语法检查、`pip-audit` 依赖审计、发布一致性检查。
+- 新增 `lint` job 与静态检查配置：`.ruff.toml`（pyflakes + bugbear + 语法级错误）、`eslint.config.mjs`（只查真会出错的规则，手写规则不依赖 `@eslint/js`）。本地对应 `npm run lint:py` / `npm run lint`。
+- 新增 `.github/dependabot.yml`：pip / npm / github-actions 每周检查依赖版本。
+- 新增 `scripts/check-release.py`：校验 README/CHANGELOG/package.json 版本一致、vendor 资产哈希、公钥哈希、requirements 上界。
+- 测试从 30 个（Python 26 + Node 4）扩到 97 个（Python 78 + Node 19），全部离线，不依赖真实 Cookie 和网络；本机可跑通 95 个，剩余 2 个受沙箱/依赖限制（详见 `docs/changes-0.7.0.md` §13）。
+- 补上「ffprobe 不存在」与 `transcribe()` 三条 ASR 降级路径（无 faster-whisper、模型加载失败、转写失败）的独立测试。
+- 修 `web/app.js` 四处 GET/POST 不匹配（`grab/finish`、`grab/cancel`、`sync` 一直 404）。
+- `cordis.patch.yml` 去掉写死的本机 Python 路径，改为自动探测。
+- 版本号统一到 0.7.0（README 之前还写着 0.4.0）。
+
+实测：Windows 11 + DSH 0.2.1-rc.3 + Python 3.12.14，`python -m unittest discover` 78 项通过、`ruff check .` 与 `eslint .` 均无告警；B 站/YouTube/TikTok 元数据解析正常，本地视频全链路正常。
+
 ## 0.6.0 — 2026-11-01
 
 两种新输入：整列视频，和硬盘上的文件。
