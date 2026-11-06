@@ -1,4 +1,4 @@
-requests>=2.31,<3
+requests>=2.34.2,<3
 numpy>=1.24,<3
 Pillow>=10.1,<14
 faster-whisper>=1.1,<2
