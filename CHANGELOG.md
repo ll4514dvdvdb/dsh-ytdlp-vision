@@ -14,6 +14,10 @@
 - `requirements.txt`: `Pillow>=10.1,<13` → `<14`。`pip-audit` 报 Pillow 12.3.0 有 21 条漏洞，修复版是 13.0.0，而原上界把修复版挡住了。已用 Pillow 13.0.0 跑通全部 27 项 pipeline 测试（`gridify()` 用到的 API 无变化）。
 - `.github/workflows/ci.yml`: Python 测试步骤补装 `requests`、`numpy`。原来只装 `Pillow`，导致 4 项测试在 CI 上报 `ModuleNotFoundError`。
 
+**跨平台字节一致性**
+- 新增 `.gitattributes`：`vendor/yt-dlp-public.key` 标 `-text`，`vendor/SHA2-256SUMS`、`SHA2-512SUMS`、`yt-dlp-py.zip` 标 `binary`，源码统一 `eol=lf`。Windows 默认 `core.autocrlf=true` 会在检出时把 LF 转 CRLF，公钥字节一变就对不上 `update.py` 里钉死的 `PUBKEY_SHA256`——结果是**所有 git clone 用户的 GPG 验签被永久静默跳过**。CI 的 windows runner 上两个签名测试挂掉才暴露。
+- 修 `test_probe_local_propagates_ffprobe_error`：原来只 patch `vision.run`，但 `probe_local()` 第一行就调 `fp()`，没装 ffprobe 的机器上先抛 `SystemExit`。补 patch `fp()` 返回假路径。
+
 **测试**
 - `tests/test_update.py` 新增 6 项：`release-assets` 重定向、验签成功、验签失败带原因、公钥导入失败、没有 gpg、包内公钥被篡改后不调用 gpg。Python 测试从 78 项增到 84 项。
 

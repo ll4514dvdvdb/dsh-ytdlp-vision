@@ -90,7 +90,37 @@
 - 结果：`PIL 13.0.0`，`python -B -m unittest tests.test_pipeline` → **27 项全部通过**。
 - 覆盖到的 API：`Image.open`、`ImageOps.contain`、`Image.new`、`ImageDraw.Draw`、`ImageFont.load_default(size=16)`、`sheet.save(quality=90)`。
 
-## 四、验证手段本身的经验
+## 四、跨平台字节一致性
+
+### 7. Windows 检出把公钥改成了另一份字节（高）
+
+- **现象**：CI 的 windows runner 上 `SignatureTests` 两项挂掉，报 `skipped: 包内公钥与钉死的哈希不一致`；同一份代码在 ubuntu 上通过。
+- **根因**：Git 在 Windows 上默认 `core.autocrlf=true`，检出时把 `vendor/yt-dlp-public.key` 的 LF 转成 CRLF。`update.py` 里钉死了它的 sha256（`PUBKEY_SHA256`），字节一变就永远对不上。
+- **影响面**：这不只是测试问题——**任何 git clone 的用户，验签都会被永久跳过**，签名校验形同虚设。
+- **修复**：新增 `.gitattributes`：
+  ```gitattributes
+  vendor/yt-dlp-public.key -text
+  vendor/SHA2-256SUMS binary
+  vendor/SHA2-512SUMS binary
+  vendor/yt-dlp-py.zip binary
+  *.py            text eol=lf
+  # 其余 .js/.mjs/.json/.yml/.yaml/.md/.txt/.toml 同样 text eol=lf
+  ```
+- **验证方式**（不用真去 Windows 机器）：用 `git -c core.autocrlf=true checkout-index -a --prefix=<tmp>\` 模拟一次 Windows 检出后再算哈希：
+  ```
+  yt-dlp-public.key: 1676 bytes crlf=False sha=45d6b415928b5f3e
+  pubkey_matches_pinned=True
+  SHA2-256SUMS: 1595 bytes crlf=False
+  ```
+- **回归保护**：`vendor/SHA2-256SUMS` 首行（`e51e69e8…  yt-dlp`）与 `vendor/VERSION.json` 的 `sha256` 一致，`scripts/check-release.py` 会校验。
+
+### 8. `test_probe_local_propagates_ffprobe_error` 在没 ffprobe 的机器上必挂（中）
+
+- **现象**：CI 两个平台的 Python 测试都报 `errors=1`，指向这一项。
+- **根因**：测试只 patch 了 `vision.run`，但 `probe_local()` 第一行就是 `raw = run([fp(), ...])`，而 `fp()` 找不到 ffprobe 时抛的是 `SystemExit`，根本走不到 `run`。本机装了 ffprobe，所以一直是绿的。
+- **修复**：补 `mock.patch.object(vision, 'fp', return_value='ffprobe')`，让测试回到它原本要验证的东西——`run` 失败时异常要向上传播。
+
+## 五、验证手段本身的经验
 
 - **负向测试**（证明静态检查真的会拦人，而不是配了不用）：
 
@@ -111,15 +141,16 @@
   5. `tempfile.mkdtemp()` 建的目录不可写（见上）。
   6. GitHub API 匿名限流 60 次/小时，连续验证会撞 `403`。
 
-## 五、本轮没有验证的（明确标出）
+## 六、本轮没有验证的（明确标出）
 
 - **Twitter/X**：仍然没有可稳定访问的公开测试样本，未验证。
-- **macOS**：没有设备，未验证。
+- **macOS**：没有设备，未验证（可以加进 CI 矩阵，本次没加）。
 - **Pillow 14**：尚未发布，未验证。
-- **CI 第二跑是否全绿**：提交后才会知道，结果会追加在本文件。
 - **`gpg` 超时分支（90 秒）**：只有代码路径，没有构造真实超时。
 
-## 六、复现命令
+已从「未验证」转为「已验证」的：CI 第二跑（run #19，5 个 job 全绿）。
+
+## 七、复现命令
 
 ```bash
 # 全量测试（Windows 上必须用装了 requests/numpy/Pillow 的解释器）
