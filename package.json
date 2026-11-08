@@ -10,7 +10,7 @@
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json"
   },
-  "author": "icyaaaww",
+  "author": "icyaaaww, ll4514dvdvdb",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ll4514dvdvdb/dsh-ytdlp-vision.git"
