@@ -231,5 +231,37 @@ class FFmpegTests(unittest.TestCase):
         second=bv.extract_frames(self.video,[{'t':4,'score':0,'reason':'test'}],out)
         self.assertNotEqual(first[0]['file'],second[0]['file'])
         self.assertNotEqual(path.read_bytes(),(out/second[0]['file']).read_bytes())
+    def test_at_frames_are_png_and_never_upscaled(self):
+        """按秒数直解的帧必须是 PNG，且不能把 320 宽的源放大到 1280。"""
+        items=bv.extract_at_frames(self.video,[0.5,3.0],self.root/'at',max_edge=1280)
+        self.assertEqual([i['t'] for i in items],[0.5,3.0])
+        for item in items:
+            path=Path(item['path'])
+            self.assertTrue(path.exists() and path.stat().st_size)
+            with Image.open(path) as im:
+                self.assertEqual(im.format,'PNG')
+                self.assertLessEqual(im.width,320)
+
+
+class FrameAtTests(unittest.TestCase):
+    def setUp(self):
+        self.work=mktmp('at')
+    def tearDown(self):
+        shutil.rmtree(self.work,ignore_errors=True)
+    def test_parse_at_accepts_lists_and_rejects_junk(self):
+        self.assertEqual(bv.parse_at('12.5,30'),[12.5,30.0])
+        self.assertEqual(bv.parse_at(' 3  7.25 '),[3.0,7.25])
+        for bad in ['','abc','1,nan']:
+            with self.assertRaises(ValueError):
+                bv.parse_at(bad)
+        with self.assertRaises(ValueError) as over:
+            bv.parse_at(','.join(str(i) for i in range(bv.MAX_AT_FRAMES+1)))
+        self.assertIn('最多',str(over.exception))
+    def test_frame_rejects_out_of_range_time(self):
+        ctx=bv.Ctx('BV1',{'title':'t','duration':12},self.work,start=0,end=12)
+        args=bv.parser().parse_args(['frame','x','--at','99'])
+        with self.assertRaises(ValueError) as cm:
+            bv.cmd_frame(ctx,args)
+        self.assertIn('超出范围',str(cm.exception))
 
 if __name__=='__main__':unittest.main(verbosity=2)

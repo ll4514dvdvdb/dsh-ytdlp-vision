@@ -173,7 +173,8 @@ async function imageRoute(ctx, exec) {
 }
 
 const properties = {
-  action: { type: 'string', enum: ['inspect', 'plan', 'text', 'frames', 'run'], description: '默认 inspect：把真实画面和文本交给当前 DSH 模型；plan 本地预算；run 额外调用独立 API。' },
+  action: { type: 'string', enum: ['inspect', 'plan', 'text', 'frames', 'frame', 'run'], description: '默认 inspect：把真实画面和文本交给当前 DSH 模型；plan 本地预算；frames 列出已抽的关键帧；frame 按 at 的秒数直接从原视频解帧（PNG，读小字和数字最准）；run 额外调用独立 API。' },
+  at: { type: 'string', description: 'action=frame 用：秒数列表，如 "12.5,30"（逗号或空格分隔，最多 8 个）。解出这些时刻的原帧给你看，不放大源分辨率' },
   target: { type: 'string', minLength: 1, description: '视频链接、播放列表/合集链接，或本机视频文件路径：B 站 BV 号/链接（支持 ?p=2）、YouTube、X/Twitter、Vimeo、抖音等 yt-dlp 支持的站点，以及 .mp4/.mkv/.webm/.mov 等本地文件' },
   playlist: { type: 'boolean', description: '强制把 target 当播放列表。带 &list= 的单个视频链接默认只看当前视频，想整列处理时置 true' },
   index: { type: 'integer', minimum: 1, maximum: 9999, description: '播放列表里的第几条（从 1 开始）。给了就按那一条单独分析' },
@@ -229,13 +230,13 @@ export function apply(ctx, config = {}) {
     const action = args.action ?? 'inspect'
     const policy = args.policy ?? config.defaultPolicy ?? 'auto'
     let attachments
-    if (action === 'inspect' && policy !== 'text') attachments = await imageRoute(ctx, exec)
+    if ((action === 'inspect' && policy !== 'text') || action === 'frame') attachments = await imageRoute(ctx, exec)
     const grid = args.gridSize ?? (args.start !== undefined || args.end !== undefined ? 1 : 4)
     const cap = attachments?.imageLimits?.maxImagesPerMessage
     if (cap && (args.maxVision ?? 12) > cap * grid) args = { ...args, maxVision: cap * grid }
     python ??= findPython(config.python)
     const argv = [action, args.target.trim(), '--vision-policy', policy]
-    const options = { ask: '--ask', maxVision: '--max-vision', gridSize: '--grid-size', start: '--start', end: '--end', maxTextTokens: '--max-text-tokens', index: '--index', limit: '--limit' }
+    const options = { ask: '--ask', maxVision: '--max-vision', gridSize: '--grid-size', start: '--start', end: '--end', maxTextTokens: '--max-text-tokens', index: '--index', limit: '--limit', at: '--at' }
     for (const [key, flag] of Object.entries(options)) if (args[key] !== undefined) argv.push(flag, String(args[key]))
     if (args.playlist) argv.push('--playlist')
     if (args.ocr === false) argv.push('--no-ocr')
@@ -244,7 +245,7 @@ export function apply(ctx, config = {}) {
     const env = args.sessionData ? { BILI_SESSDATA: args.sessionData } : {}
     const response = await runPy(python, argv, { timeoutMs, signal: exec.signal, env })
     exec.signal?.throwIfAborted()
-    if (action !== 'inspect') return result(response.out.trim() + (action === 'text' && response.err ? `\n\n[处理说明]\n${response.err.slice(-1200)}` : ''))
+    if (action !== 'inspect' && action !== 'frame') return result(response.out.trim() + (action === 'text' && response.err ? `\n\n[处理说明]\n${response.err.slice(-1200)}` : ''))
     const evidence = JSON.parse(response.out)
     if (!evidence.images.length) return result(evidence.text)
     const root = await realpath(cacheRoot())
@@ -253,7 +254,7 @@ export function apply(ctx, config = {}) {
       const path = await realpath(item.path)
       const rel = relative(root, path)
       if (isAbsolute(rel) || rel === '..' || rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`)) throw new Error('图片不在视频缓存目录中')
-      inputs.push({ data: await readFile(path), mediaType: 'image/jpeg', name: basename(path) })
+      inputs.push({ data: await readFile(path), mediaType: path.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg', name: basename(path) })
     }
     exec.signal?.throwIfAborted()
     const refs = await attachments.saveImages(inputs)

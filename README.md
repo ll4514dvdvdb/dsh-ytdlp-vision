@@ -47,7 +47,7 @@ target ──┬─ B 站（BV 号 / bilibili.com / b23.tv）
 
 ```powershell
 # 1. 取包（或用 git clone https://github.com/ll4514dvdvdb/dsh-ytdlp-vision）
-curl -L -o ytdlp-vision.zip https://github.com/ll4514dvdvdb/dsh-ytdlp-vision/releases/download/v0.7.1/ytdlp-vision-0.7.1.zip
+curl -L -o ytdlp-vision.zip https://github.com/ll4514dvdvdb/dsh-ytdlp-vision/releases/download/v0.8.0/ytdlp-vision-0.8.0.zip
 Expand-Archive ytdlp-vision.zip -DestinationPath "$env:USERPROFILE\.dsh\ytdlp-vision-src" -Force
 
 # 2. 装 Python 依赖（用 DSH 自带解释器或任意 3.10+）
@@ -87,7 +87,8 @@ python -m pip install -r requirements.txt
 | 参数 | 类型 | 说明 |
 |---|---|---|
 | `target` | string，必填 | BV 号、B 站链接、b23.tv 短链、任意 yt-dlp 支持的 URL、播放列表/合集链接，或本机视频文件路径 |
-| `action` | `inspect`（默认）/ `plan` / `text` / `frames` / `run` | 见下 |
+| `action` | `inspect`（默认）/ `plan` / `text` / `frames` / `frame` / `run` | 见下 |
+| `at` | string | `action=frame` 用：秒数列表，如 `"12.5,30"`，最多 8 个 |
 | `ask` | string | 你的问题，用于选帧相关度打分 |
 | `policy` | `auto` / `always` / `text` | `text` 只取文本证据，跳过所有画面处理 |
 | `maxVision` | 1–36，默认 12 | 最多返回多少帧（会被 `attachments.imageLimits.maxImagesPerMessage` 夹住） |
@@ -107,7 +108,17 @@ python -m pip install -r requirements.txt
 - `text`：只要字幕/转写，不下载视频，最快最省。对播放列表用 `text` 会返回前 `limit` 条的字幕摘要。
 - `plan`：只算预算和选帧计划，不抽帧。对播放列表只返回条目清单。
 - `frames`：只抽帧，不做转录。
+- `frame`：给 `at` 里的秒数，直接从原视频解出那几秒的**原帧**（PNG，最长边 ≤1280，不放大源分辨率），交给当前模型看。核对画面里的文字、数字、小字用它，不要靠采样的文字描述推断。
 - `run`：额外调用独立的视觉 API（需在 config 里配），成本另算。
+
+先整体看、再对关键秒数抽原帧：
+
+```
+# 便宜地看全片（采样 + 字幕 + OCR）
+ytdlp_vision({ target: "https://b23.tv/xxx", ask: "第 3 章讲了什么" })
+# 对可疑的秒数直解原帧核对
+ytdlp_vision({ target: "https://b23.tv/xxx", action: "frame", at: "36,59.5" })
+```
 
 ### 播放列表 / 合集
 

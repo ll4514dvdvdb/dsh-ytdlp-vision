@@ -68,6 +68,8 @@ MIN_FREE_BYTES = int(float(_env("MIN_FREE_GB") or 1) * (1 << 30))
 MAX_MEDIA_BYTES = int(float(_env("MAX_MEDIA_GB") or 8) * (1 << 30))
 # ffmpeg 流式解码的看门狗上限：卡死时杀进程报错，别把插件永久挂住
 FFMPEG_STREAM_TIMEOUT = float(_env("FFMPEG_TIMEOUT") or 900)
+# frame 命令一次最多抽几张原帧（每张都要给模型看，多了反而看不清重点）
+MAX_AT_FRAMES = int(_env("MAX_AT_FRAMES") or 8)
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
@@ -603,6 +605,69 @@ def extract_frames(video: Path, items: list[dict], outdir: Path,
 
 
 
+def extract_at_frames(video: Path, times: list[float], outdir: Path,
+                      max_edge: int = 1280, timeout: int = 120) -> list[dict]:
+    """按精确秒数从原视频直解帧：PNG 无损，最长边不超过 max_edge，也不放大源分辨率。"""
+    outdir.mkdir(parents=True, exist_ok=True)
+    items: list[dict] = []
+    for t in times:
+        dst = outdir / f'at_{round(t * 1000):010d}.png'
+        tmp = dst.with_name(dst.stem + '.part.png')
+        try:
+            run([ff(), '-v', 'error', '-ss', f'{t:.3f}', '-i', str(video), '-frames:v', '1',
+                 '-vf', f"scale='min({max_edge},iw)':-2:out_range=full",
+                 '-threads', '1', '-y', str(tmp)], timeout=timeout)
+            if not tmp.exists() or not tmp.stat().st_size:
+                raise RuntimeError(f'{t:g}s 没有可解码视频帧')
+            os.replace(tmp, dst)
+        finally:
+            tmp.unlink(missing_ok=True)
+        items.append({'t': t, 'path': str(dst), 'reason': 'at'})
+    return items
+
+
+def parse_at(raw: str) -> list[float]:
+    """把 '12.5,30,45' 解析成秒数列表。"""
+    times: list[float] = []
+    for part in re.split(r'[,\s]+', (raw or '').strip()):
+        if not part:
+            continue
+        try:
+            value = float(part)
+        except ValueError:
+            raise ValueError(f'时间点 {part!r} 不是秒数，例如 --at 12.5,30') from None
+        if not math.isfinite(value):
+            raise ValueError(f'时间点 {part!r} 必须是有限秒数')
+        times.append(value)
+    if not times:
+        raise ValueError('--at 至少需要一个时间点，例如 --at 12.5,30')
+    if len(times) > MAX_AT_FRAMES:
+        raise ValueError(f'一次最多抽 {MAX_AT_FRAMES} 帧；更多请分几次，或先用 inspect 找关键时段')
+    return times
+
+
+def cmd_frame(ctx: Ctx, args) -> dict:
+    """frame 命令：给几个秒数，直接解出那几秒的原帧 PNG。"""
+    times = parse_at(args.at)
+    end = ctx.end or float(ctx.meta['duration'])
+    bad = [t for t in times if not 0 <= t < end]
+    if bad:
+        raise ValueError(f"{','.join(f'{t:g}' for t in bad)}s 超出范围 0..{end:.1f}s")
+    video = ctx.video
+    if not video or not Path(video).exists():
+        raise RuntimeError('这个视频取不到画面，无法抽帧')
+    # 核对画面文字要靠细节，所以下限 1280；上限仍服从 --frame-width 的校验区间
+    max_edge = max(args.frame_width, 1280)
+    items = extract_at_frames(Path(video), times, ctx.work / 'frames', max_edge=max_edge)
+    lines = [f"[{it['t']:.2f}s 原帧] {it['path']}" for it in items]
+    text = ('[按时间点直解的原帧，不是采样推断]\n' + '\n'.join(lines)
+            + f'\n共 {len(items)} 张 PNG，最长边 ≤{max_edge}（不放大源分辨率）。'
+              '画面文字、数字、小字以这些帧为准；采样描述只是解释。')
+    return {'text': text,
+            'images': [{'t': it['t'], 'path': it['path']} for it in items],
+            'coverage': {'requested': times, 'returned': len(items)}}
+
+
 def gridify(files: list[Path], dst: Path, cols: int = 2,
             labels: list[str] | None = None) -> Path:
     from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -820,6 +885,7 @@ class Ctx:
     skeleton: str = 'visual'
     start: float = 0.
     end: float = 0.
+    video: Path | None = None
 
 
 @contextlib.contextmanager
@@ -1110,9 +1176,11 @@ def prepare(args, source: vidsrc.Source | None = None) -> Ctx:
             f"抽帧会先缩放到 frame_width，内存与耗时可能偏高。")
     text_only=args.cmd=='text' or args.vision_policy=='text' or args.subtitle_only
     need_visual=not (args.no_video or text_only)
-    need_speech=not (args.no_asr or args.subtitle_only or args.cmd=='frames')
+    # frames/frame 只用画面，不取字幕、不转写
+    light=args.cmd in ('frames','frame')
+    need_speech=not (args.no_asr or args.subtitle_only or light)
     sessdata=args.sessdata or vcookies.sessdata()
-    if args.cmd!='frames':
+    if not light:
         sub_path=work/'subtitle.json'
         cached=load_json(sub_path)
         fresh=(cached is not None and time.time()-cached.get('saved',0)<86400
@@ -1166,7 +1234,7 @@ def prepare(args, source: vidsrc.Source | None = None) -> Ctx:
                 ctx.asr=[]
             if ctx.asr:
                 save_json(asr_path,ctx.asr)
-    if not ctx.subtitle and not ctx.asr and args.cmd!='frames':
+    if not ctx.subtitle and not ctx.asr and not light:
         ctx.warnings.append('没有可用字幕/转写；不能据此推断口播内容。')
     if need_visual:
         if source.kind=='bilibili':
@@ -1175,7 +1243,9 @@ def prepare(args, source: vidsrc.Source | None = None) -> Ctx:
             video=Path(meta['local_path'])
         else:
             video=vidsrc.download_video_ytdlp(source,work,args.height)
-        if video:
+        ctx.video=video
+        # frame 只要指定时间点的原帧，不走采样与关键帧预算（那会把 60 帧全抽一遍）
+        if video and args.cmd!='frame':
             info_path=work/f'video_info_{args.height}_{video.stat().st_size}.json'
             info=load_json(info_path)
             if info is None or 'duration' not in info:
@@ -1211,7 +1281,7 @@ def prepare(args, source: vidsrc.Source | None = None) -> Ctx:
                                    floor_sec=args.coverage_gap,max_frames=args.max_frames)
                 ctx.frames=extract_frames(video,picked,work/'frames',args.frame_width,args.refresh)
                 save_json(cache_path,{'frames':ctx.frames,'scenes':ctx.scenes})
-        if not ctx.frames:
+        if not ctx.frames and args.cmd!='frame':
             ctx.warnings.append('视频画面不可用；以下仅包含文本，不能声称已看过画面。')
     ctx.units,ctx.skeleton=build_units(meta,ctx.subtitle,ctx.asr,ctx.scenes,duration)
     if ctx.frames:
@@ -1490,7 +1560,8 @@ def cmd_run(ctx: Ctx, args, evidence: dict) -> None:
 
 def parser():
     ap=argparse.ArgumentParser(prog='bv',description='本地整理视频证据，供 DSH 直接看图；独立 run 可选')
-    ap.add_argument('cmd',choices=['inspect','plan','run','frames','text','clean','cache-stats','cache-clean'])
+    ap.add_argument('cmd',choices=['inspect','plan','run','frames','frame','text','clean','cache-stats','cache-clean'])
+    ap.add_argument('--at',default='',help='frame 命令用：秒数列表，如 12.5,30（最多 8 个）')
     ap.add_argument('target',nargs='?',default='')
     ap.add_argument('--ask',default='这个视频讲了什么？按时间顺序说清主线。')
     ap.add_argument('--sessdata',default='')
@@ -1629,6 +1700,9 @@ def main():
                 print(f'\n完整文本：{path}；可指定 start/end 继续获取。')
             if ctx.warnings:
                 log('\n'.join(ctx.warnings))
+            return
+        if args.cmd=='frame':
+            print(json.dumps(cmd_frame(ctx,args),ensure_ascii=False))
             return
         if args.cmd=='frames':
             for f in ctx.frames:
